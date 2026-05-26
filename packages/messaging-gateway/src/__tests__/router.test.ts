@@ -85,6 +85,8 @@ function makeFakeAdapter(): PlatformAdapter {
     sendButtons: noop,
     sendTyping: async () => {},
     sendFile: noop,
+    markMessageReceived: mock(async () => {}),
+    clearMessageReceived: mock(async () => {}),
   } as unknown as PlatformAdapter
 }
 
@@ -113,7 +115,11 @@ function makeRouter() {
 describe('Router', () => {
   it('forwards a text-only bound message to sendMessage', async () => {
     const { router, sessionManager } = makeRouter()
-    await router.route(makeFakeAdapter(), baseMsg({ text: 'hi there' }))
+    const adapter = makeFakeAdapter()
+    const msg = baseMsg({ text: 'hi there' })
+    await router.route(adapter, msg)
+    expect(adapter.markMessageReceived).toHaveBeenCalledWith(msg)
+    expect(adapter.clearMessageReceived).toHaveBeenCalledWith(msg)
     expect(sessionManager.sendMessage).toHaveBeenCalledTimes(1)
     const args = sessionManager.sendMessage.mock.calls[0]!
     expect(args[0]).toBe('sess-A') // sessionId

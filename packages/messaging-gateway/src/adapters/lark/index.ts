@@ -45,6 +45,7 @@ import {
  * we fail fast in the adapter with a user-visible reply.
  */
 const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024
+const DEDUP_MAX = 1000
 
 const NOOP_LOGGER: MessagingLogger = {
   info: () => {},
@@ -107,6 +108,44 @@ function resolveLarkDomain(domain: 'lark' | 'feishu'): lark.Domain {
   return domain === 'feishu' ? lark.Domain.Feishu : lark.Domain.Lark
 }
 
+function extractLarkMessageId(result: unknown): string {
+  if (!result || typeof result !== 'object') return ''
+  const root = result as Record<string, unknown>
+  const data = root.data && typeof root.data === 'object' ? (root.data as Record<string, unknown>) : undefined
+  const nestedData =
+    data?.data && typeof data.data === 'object' ? (data.data as Record<string, unknown>) : undefined
+
+  const candidates = [
+    root.message_id,
+    root.messageId,
+    data?.message_id,
+    data?.messageId,
+    nestedData?.message_id,
+    nestedData?.messageId,
+  ]
+  const id = candidates.find((value): value is string => typeof value === 'string' && value.length > 0)
+  return id ?? ''
+}
+
+function extractLarkReactionId(result: unknown): string {
+  if (!result || typeof result !== 'object') return ''
+  const root = result as Record<string, unknown>
+  const data = root.data && typeof root.data === 'object' ? (root.data as Record<string, unknown>) : undefined
+  const nestedData =
+    data?.data && typeof data.data === 'object' ? (data.data as Record<string, unknown>) : undefined
+
+  const candidates = [
+    root.reaction_id,
+    root.reactionId,
+    data?.reaction_id,
+    data?.reactionId,
+    nestedData?.reaction_id,
+    nestedData?.reactionId,
+  ]
+  const id = candidates.find((value): value is string => typeof value === 'string' && value.length > 0)
+  return id ?? ''
+}
+
 /**
  * Strip a leading `<at user_id="...">…</at> ` prefix from a Lark text message
  * content. Lark prepends the @mention as a literal in the content, but the
@@ -114,6 +153,16 @@ function resolveLarkDomain(domain: 'lark' | 'feishu'): lark.Domain {
  */
 function stripMentionPrefix(text: string): string {
   return text.replace(/^<at[^>]*>[^<]*<\/at>\s*/, '').trim()
+}
+
+function stripMarkdownForLarkText(text: string): string {
+  return text
+    .replace(/```[a-zA-Z0-9_+-]*\n([\s\S]*?)\n```/g, '$1')
+    .replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g, '$1 ($2)')
+    .replace(/(\*\*|__)(.*?)\1/g, '$2')
+    .replace(/(\*|_)(.*?)\1/g, '$2')
+    .replace(/~~(.*?)~~/g, '$1')
+    .replace(/`([^`]+)`/g, '$1')
 }
 
 /**
@@ -128,7 +177,7 @@ interface LarkClient {
       create: (args: {
         params: { receive_id_type: 'chat_id' | 'open_id' | 'union_id' }
         data: { receive_id: string; msg_type: string; content: string; uuid?: string }
-      }) => Promise<{ data?: { message_id?: string } } | null>
+      }) => Promise<unknown>
       update: (args: {
         path: { message_id: string }
         data: { msg_type: string; content: string }
@@ -136,6 +185,15 @@ interface LarkClient {
       patch: (args: {
         path: { message_id: string }
         data: { content: string }
+      }) => Promise<unknown>
+    }
+    messageReaction: {
+      create: (args: {
+        path: { message_id: string }
+        data: { reaction_type: { emoji_type: string } }
+      }) => Promise<unknown>
+      delete: (args: {
+        path: { message_id: string; reaction_id: string }
       }) => Promise<unknown>
     }
     file: {
@@ -210,12 +268,65 @@ export class LarkAdapter implements PlatformAdapter {
   private buttonHandler: ((press: ButtonPress) => Promise<void>) | null = null
   private connected = false
   private log: MessagingLogger = NOOP_LOGGER
+  private seenMessageIds = new Set<string>()
   /**
    * Track each outbound message's wire `msg_type` so `editMessage` can dispatch
    * to `update` (text/post) vs `patch` (interactive card) correctly. Lark
    * requires the new `msg_type` to match the original.
    */
   private sentMsgTypes = new Map<string, 'text' | 'post' | 'interactive'>()
+  private receivedReactionIds = new Map<string, string>()
+
+  async markMessageReceived(msg: IncomingMessage): Promise<void> {
+    if (!this.client || !msg.messageId) return
+    try {
+      const result = await this.client.im.messageReaction.create({
+        path: { message_id: msg.messageId },
+        data: { reaction_type: { emoji_type: 'Get' } },
+      })
+      const reactionId = extractLarkReactionId(result)
+      if (reactionId) this.receivedReactionIds.set(msg.messageId, reactionId)
+      this.log.info('[lark] marked inbound message as received', {
+        event: 'lark_message_get_reaction_ok',
+        chatId: msg.channelId,
+        messageId: msg.messageId,
+        reactionId,
+      })
+    } catch (err: unknown) {
+      this.log.warn('[lark] failed to add GET reaction', {
+        event: 'lark_message_get_reaction_failed',
+        chatId: msg.channelId,
+        messageId: msg.messageId,
+        error: err instanceof Error ? err.message : String(err),
+      })
+    }
+  }
+
+  async clearMessageReceived(msg: IncomingMessage): Promise<void> {
+    if (!this.client || !msg.messageId) return
+    const reactionId = this.receivedReactionIds.get(msg.messageId)
+    if (!reactionId) return
+    try {
+      await this.client.im.messageReaction.delete({
+        path: { message_id: msg.messageId, reaction_id: reactionId },
+      })
+      this.receivedReactionIds.delete(msg.messageId)
+      this.log.info('[lark] cleared inbound message received reaction', {
+        event: 'lark_message_get_reaction_cleared',
+        chatId: msg.channelId,
+        messageId: msg.messageId,
+        reactionId,
+      })
+    } catch (err: unknown) {
+      this.log.warn('[lark] failed to clear GET reaction', {
+        event: 'lark_message_get_reaction_clear_failed',
+        chatId: msg.channelId,
+        messageId: msg.messageId,
+        reactionId,
+        error: err instanceof Error ? err.message : String(err),
+      })
+    }
+  }
 
   /** Fetch bot profile for UI hints. */
   async getBotInfo(): Promise<{ name?: string } | null> {
@@ -300,13 +411,20 @@ export class LarkAdapter implements PlatformAdapter {
   }
 
   async destroy(): Promise<void> {
-    // The SDK's WSClient doesn't currently expose a `.stop()` method in its
-    // public types — it tears down on process exit. We null out our refs so
-    // re-init works; the underlying socket gets garbage-collected.
+    const wsClient = this.wsClient as
+      | {
+          close?: (opts?: { force?: boolean }) => void | Promise<void>
+        }
+      | null
+    if (wsClient?.close) {
+      await wsClient.close({ force: true })
+    }
     this.wsClient = null
     this.client = null
     this.connected = false
     this.sentMsgTypes.clear()
+    this.seenMessageIds.clear()
+    this.receivedReactionIds.clear()
   }
 
   isConnected(): boolean {
@@ -333,12 +451,40 @@ export class LarkAdapter implements PlatformAdapter {
         ? { msgType: 'text' as const, content: JSON.stringify({ text: formatted.text }) }
         : { msgType: 'post' as const, content: JSON.stringify(formatted.post) }
 
-    const result = await this.client.im.message.create({
-      params: { receive_id_type: 'chat_id' },
-      data: { receive_id: channelId, msg_type: msgType, content },
-    })
-    const messageId = result?.data?.message_id ?? ''
-    if (messageId) this.sentMsgTypes.set(messageId, msgType)
+    let result: unknown
+    let finalMsgType = msgType
+    try {
+      result = await this.client.im.message.create({
+        params: { receive_id_type: 'chat_id' },
+        data: { receive_id: channelId, msg_type: msgType, content },
+      })
+    } catch (err: unknown) {
+      if (msgType !== 'post') throw err
+      finalMsgType = 'text'
+      const fallbackText = stripMarkdownForLarkText(text)
+      this.log.warn('[lark] post send failed; falling back to text', {
+        event: 'lark_post_send_fallback',
+        chatId: channelId,
+        error: err instanceof Error ? err.message : String(err),
+      })
+      result = await this.client.im.message.create({
+        params: { receive_id_type: 'chat_id' },
+        data: {
+          receive_id: channelId,
+          msg_type: 'text',
+          content: JSON.stringify({ text: fallbackText }),
+        },
+      })
+    }
+    const messageId = extractLarkMessageId(result)
+    if (!messageId) {
+      this.log.warn('[lark] sendText returned no message id', {
+        event: 'lark_send_text_no_message_id',
+        chatId: channelId,
+        msgType: finalMsgType,
+      })
+    }
+    if (messageId) this.sentMsgTypes.set(messageId, finalMsgType)
     return { platform: 'lark', channelId, messageId }
   }
 
@@ -363,7 +509,21 @@ export class LarkAdapter implements PlatformAdapter {
           data: { content: JSON.stringify(buildClearedCard(text)) },
         })
       } catch (err: unknown) {
-        if (isLarkEditExpiredError(err)) return
+        if (isLarkEditExpiredError(err)) {
+          this.log.warn('[lark] card edit expired or unavailable', {
+            event: 'lark_card_edit_expired',
+            chatId: channelId,
+            messageId,
+            error: err instanceof Error ? err.message : String(err),
+          })
+          return
+        }
+        this.log.warn('[lark] card edit failed', {
+          event: 'lark_card_edit_failed',
+          chatId: channelId,
+          messageId,
+          error: err instanceof Error ? err.message : String(err),
+        })
         throw err
       }
       return
@@ -390,7 +550,23 @@ export class LarkAdapter implements PlatformAdapter {
         data: { msg_type: msgType, content },
       })
     } catch (err: unknown) {
-      if (isLarkEditExpiredError(err)) return
+      if (isLarkEditExpiredError(err)) {
+        this.log.warn('[lark] message edit expired or unavailable', {
+          event: 'lark_message_edit_expired',
+          chatId: channelId,
+          messageId,
+          msgType,
+          error: err instanceof Error ? err.message : String(err),
+        })
+        return
+      }
+      this.log.warn('[lark] message edit failed', {
+        event: 'lark_message_edit_failed',
+        chatId: channelId,
+        messageId,
+        msgType,
+        error: err instanceof Error ? err.message : String(err),
+      })
       throw err
     }
   }
@@ -435,7 +611,7 @@ export class LarkAdapter implements PlatformAdapter {
           content: cardJson,
         },
       })
-      messageId = result?.data?.message_id ?? ''
+      messageId = extractLarkMessageId(result)
       this.log.info('[lark] sent card', {
         event: 'lark_send_card_ok',
         chatId: channelId,
@@ -573,7 +749,7 @@ export class LarkAdapter implements PlatformAdapter {
       params: { receive_id_type: 'chat_id' },
       data: { receive_id: channelId, msg_type: msgType, content },
     })
-    const messageId = result?.data?.message_id ?? ''
+    const messageId = extractLarkMessageId(result)
 
     // Lark can't combine caption + file in one message. If the caller wants a
     // caption, send it as a follow-up text message (best-effort).
@@ -609,6 +785,16 @@ export class LarkAdapter implements PlatformAdapter {
       messageId: message.message_id,
     })
 
+    if (this.seenMessageIds.has(message.message_id)) {
+      this.log.info('[lark] dropped duplicate event', {
+        event: 'lark_duplicate_event',
+        chatId: message.chat_id,
+        messageId: message.message_id,
+      })
+      return
+    }
+    this.rememberMessageId(message.message_id)
+
     const senderId =
       sender.sender_id?.user_id ?? sender.sender_id?.open_id ?? sender.sender_id?.union_id ?? ''
 
@@ -633,7 +819,7 @@ export class LarkAdapter implements PlatformAdapter {
         timestamp: parseInt(message.create_time, 10) || Date.now(),
         raw: message,
       }
-      await this.messageHandler(msg)
+      this.dispatchIncomingMessage(msg)
       return
     }
 
@@ -705,7 +891,7 @@ export class LarkAdapter implements PlatformAdapter {
       timestamp: parseInt(message.create_time, 10) || Date.now(),
       raw: message,
     }
-    await this.messageHandler(msg)
+    this.dispatchIncomingMessage(msg)
   }
 
   /**
@@ -807,5 +993,31 @@ export class LarkAdapter implements PlatformAdapter {
       ...(value.data !== undefined ? { data: value.data } : {}),
     }
     await this.buttonHandler(press)
+  }
+
+  private rememberMessageId(messageId: string): void {
+    this.seenMessageIds.add(messageId)
+    if (this.seenMessageIds.size <= DEDUP_MAX) return
+
+    const overflow = this.seenMessageIds.size - DEDUP_MAX
+    let removed = 0
+    for (const staleId of this.seenMessageIds) {
+      this.seenMessageIds.delete(staleId)
+      removed++
+      if (removed >= overflow) break
+    }
+  }
+
+  private dispatchIncomingMessage(msg: IncomingMessage): void {
+    const handler = this.messageHandler
+    if (!handler) return
+    void handler(msg).catch((err: unknown) => {
+      this.log.error('[lark] inbound message handler failed', {
+        event: 'lark_message_handler_failed',
+        chatId: msg.channelId,
+        messageId: msg.messageId,
+        error: err instanceof Error ? err.message : String(err),
+      })
+    })
   }
 }

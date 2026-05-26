@@ -103,6 +103,13 @@ function makeBinding(overrides: Partial<BindingConfig> = {}): ChannelBinding {
   }
 }
 
+function makeLarkBinding(overrides: Partial<BindingConfig> = {}): ChannelBinding {
+  return {
+    ...makeBinding(overrides),
+    platform: 'lark',
+  }
+}
+
 async function play(
   renderer: Renderer,
   binding: ChannelBinding,
@@ -285,6 +292,70 @@ describe('Renderer — progress mode (default)', () => {
     expect(edits.length).toBe(2)
     expect(edits[0]!.text).toBe('💭 thinking…')
     expect(edits[1]!.text).toBe('done')
+  })
+
+  it('serializes fast final events so complete edits the pending thinking bubble', async () => {
+    const adapter = makeAdapter()
+    let releaseSend!: () => void
+    let sendStarted!: Promise<void>
+    let markSendStarted!: () => void
+    sendStarted = new Promise<void>((resolve) => {
+      markSendStarted = resolve
+    })
+    const originalSendText = adapter.sendText.bind(adapter)
+    adapter.sendText = async (channelId, text, opts) => {
+      if (text === '💭 thinking…') {
+        markSendStarted()
+        await new Promise<void>((resolve) => {
+          releaseSend = resolve
+        })
+      }
+      return originalSendText(channelId, text, opts)
+    }
+    const binding = makeBinding()
+
+    const finalEvent = renderer.handle(ev.final('你好！有什么需要帮忙的吗？'), binding, adapter)
+    const completeEvent = renderer.handle(ev.complete(), binding, adapter)
+
+    await sendStarted
+    expect(adapter.calls).toEqual([])
+    releaseSend()
+    await Promise.all([finalEvent, completeEvent])
+
+    expect(adapter.calls).toEqual([
+      {
+        kind: 'sendText',
+        channelId: 'chan-1',
+        messageId: '1',
+        text: '💭 thinking…',
+      },
+      {
+        kind: 'editMessage',
+        channelId: 'chan-1',
+        messageId: '1',
+        text: '你好！有什么需要帮忙的吗？',
+      },
+    ])
+  })
+
+  it('does not post progress bubbles for Lark because Lark uses GET reactions', async () => {
+    const adapter = makeAdapter()
+    adapter.platform = 'lark'
+    const binding = makeLarkBinding()
+
+    await play(renderer, binding, adapter, [
+      ev.final('你好！有什么需要帮忙的吗？'),
+      ev.complete(),
+    ])
+
+    expect(adapter.calls).toEqual([
+      {
+        kind: 'sendText',
+        channelId: 'chan-1',
+        messageId: '1',
+        text: '你好！有什么需要帮忙的吗？',
+      },
+    ])
   })
 })
 

@@ -133,6 +133,7 @@ export type PermissionMessageRecorder = (
 export class Renderer {
   /** Per-binding render state. Keyed by binding.id */
   private states = new Map<string, RenderState>()
+  private renderQueues = new Map<string, Promise<void>>()
   private readonly planTokens: PlanTokenRegistry | undefined
   private readonly recordPlanMessage: PlanMessageRecorder | undefined
   private readonly recordPermissionMessage: PermissionMessageRecorder | undefined
@@ -169,6 +170,26 @@ export class Renderer {
 
   /** Handle an outbound session event for a specific binding. */
   async handle(
+    event: SessionEvent,
+    binding: ChannelBinding,
+    adapter: PlatformAdapter,
+  ): Promise<void> {
+    const previous = this.renderQueues.get(binding.id) ?? Promise.resolve()
+    const current = previous
+      .catch(() => {})
+      .then(() => this.handleNow(event, binding, adapter))
+
+    this.renderQueues.set(binding.id, current)
+    try {
+      await current
+    } finally {
+      if (this.renderQueues.get(binding.id) === current) {
+        this.renderQueues.delete(binding.id)
+      }
+    }
+  }
+
+  private async handleNow(
     event: SessionEvent,
     binding: ChannelBinding,
     adapter: PlatformAdapter,
@@ -417,6 +438,12 @@ export class Renderer {
     adapter: PlatformAdapter,
     status: string,
   ): Promise<void> {
+    if (binding.platform === 'lark') {
+      // Lark/Feishu uses a lightweight reaction on the user's original
+      // message ("GET") instead of posting a separate progress bubble.
+      void status
+      return
+    }
     if (!state.progressMessageId) {
       try {
         const sent = await adapter.sendText(binding.channelId, status, bindingOpts(binding))

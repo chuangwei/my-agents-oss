@@ -200,6 +200,14 @@ export interface PlatformAdapter {
   sendFile(channelId: string, file: Buffer, filename: string, caption?: string, opts?: SendOptions): Promise<SentMessage>
 
   /**
+   * Optional acknowledgement on the original inbound message. Lark uses this
+   * for lightweight reactions (for example "GET") instead of posting a
+   * separate progress bubble.
+   */
+  markMessageReceived?(msg: IncomingMessage): Promise<void>
+  clearMessageReceived?(msg: IncomingMessage): Promise<void>
+
+  /**
    * Clear the inline keyboard on a previously-sent message. Optional because
    * only platforms with inline-button support (currently Telegram) need it.
    * Errors are the caller's concern — most implementations should swallow

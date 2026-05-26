@@ -88,13 +88,34 @@ export class Router {
           bindingId: binding.id,
           attachmentCount: fileAttachments?.length ?? 0,
         })
-        await this.sessionManager.sendMessage(
-          binding.sessionId,
-          msg.text,
-          fileAttachments,
-          undefined, // storedAttachments (handled by session layer)
-          undefined, // SendMessageOptions
-        )
+        await adapter.markMessageReceived?.(msg).catch((err) => {
+          this.log.warn('failed to mark inbound chat message as received', {
+            event: 'message_received_mark_failed',
+            platform: msg.platform,
+            channelId: msg.channelId,
+            messageId: msg.messageId,
+            error: err instanceof Error ? err.message : String(err),
+          })
+        })
+        try {
+          await this.sessionManager.sendMessage(
+            binding.sessionId,
+            msg.text,
+            fileAttachments,
+            undefined, // storedAttachments (handled by session layer)
+            undefined, // SendMessageOptions
+          )
+        } finally {
+          await adapter.clearMessageReceived?.(msg).catch((err) => {
+            this.log.warn('failed to clear inbound chat message received mark', {
+              event: 'message_received_clear_failed',
+              platform: msg.platform,
+              channelId: msg.channelId,
+              messageId: msg.messageId,
+              error: err instanceof Error ? err.message : String(err),
+            })
+          })
+        }
       } catch (err) {
         const errorMsg = err instanceof Error ? err.message : 'Unknown error'
         this.log.error('failed to route inbound chat message', {
