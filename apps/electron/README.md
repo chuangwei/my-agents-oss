@@ -1,5 +1,7 @@
 # Craft Agents Electron App
 
+[中文版](README.zh-CN.md)
+
 The primary desktop interface for Craft Agents, built with Electron + React. Provides a multi-session inbox with chat interface for interacting with Claude via Craft workspaces.
 
 ## Quick Start
