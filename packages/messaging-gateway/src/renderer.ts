@@ -443,10 +443,11 @@ export class Renderer {
   ): Promise<void> {
     if (binding.platform === 'lark' || binding.platform === 'wechat') {
       // Lark/Feishu uses a lightweight reaction instead of a progress bubble.
-      // WeChat's iLink protocol accepts only ONE reply per user turn — a second
-      // message (progress bubble + final answer) makes the server drop the real
-      // reply and show "请稍后再试。". Both skip the separate progress bubble and
-      // deliver a single message on `complete`.
+      // WeChat/iLink has a hard per-turn reply deadline; staying silent until
+      // the final answer blows it (the server then shows "请稍后再试。"). The
+      // turn is kept alive by the adapter's heartbeat typing (sendTyping every
+      // ~5s, the official iLink mechanism — no progress bubbles), not from
+      // here — the renderer stays silent until the final answer on `complete`.
       void status
       return
     }

@@ -224,7 +224,10 @@ export interface SendMessageReq {
 }
 
 export interface SendMessageResp {
-  // empty
+  ret?: number;
+  /** Error code returned by the server (e.g. -14 = session timeout). Present when the reply is rejected. */
+  errcode?: number;
+  errmsg?: string;
 }
 
 /** Typing status: 1 = typing (default), 2 = cancel typing. */

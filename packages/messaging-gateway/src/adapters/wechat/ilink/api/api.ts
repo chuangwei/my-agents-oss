@@ -13,6 +13,7 @@ import type {
   NotifyStopResp,
   NotifyStartResp,
   SendMessageReq,
+  SendMessageResp,
   SendTypingReq,
   GetConfigResp,
 } from "./types";
@@ -407,11 +408,20 @@ export async function getUploadUrl(
   return resp;
 }
 
-/** Send a single message downstream. */
+/**
+ * Send a single message downstream.
+ *
+ * The sendmessage endpoint returns HTTP 200 even when it rejects the reply
+ * (e.g. an expired context_token / closed turn) — the user then sees WeChat's
+ * own "请稍后再试。" fallback instead of the bot's message. The real status is
+ * carried in the response body's ret/errcode, so a non-zero code is surfaced
+ * as a thrown error rather than a silent success; otherwise the dropped reply
+ * is invisible. Mirrors the inbound getUpdates handling in monitor.ts.
+ */
 export async function sendMessage(
   params: WeixinApiOptions & { body: SendMessageReq },
 ): Promise<void> {
-  await apiPostFetch({
+  const rawText = await apiPostFetch({
     baseUrl: params.baseUrl,
     endpoint: "ilink/bot/sendmessage",
     body: JSON.stringify({ ...params.body, base_info: buildBaseInfo() }),
@@ -419,6 +429,43 @@ export async function sendMessage(
     timeoutMs: params.timeoutMs ?? DEFAULT_API_TIMEOUT_MS,
     label: "sendMessage",
   });
+  const resp = parseSendMessageResp(rawText);
+  // Log every send outcome (state 1=GENERATING keep-alive, 2=FINISH final) so a
+  // turn that the server still rejects/times-out is diagnosable: the timestamp
+  // gives latency-since-inbound and ret/errcode give the server's verdict.
+  const msg = params.body.msg;
+  logger.info(
+    `sendMessage outcome: state=${msg?.message_state} clientId=${msg?.client_id} ` +
+      `hasContextToken=${Boolean(msg?.context_token)} ret=${resp?.ret ?? 0} ` +
+      `errcode=${resp?.errcode ?? 0}${resp?.errmsg ? ` errmsg=${resp.errmsg}` : ""} ` +
+      `raw=${redactBody(rawText).slice(0, 160)}`,
+  );
+  if (
+    resp &&
+    ((resp.ret !== undefined && resp.ret !== 0) ||
+      (resp.errcode !== undefined && resp.errcode !== 0))
+  ) {
+    throw new Error(
+      `sendMessage rejected by server: ret=${resp.ret} errcode=${resp.errcode} errmsg=${resp.errmsg ?? ""}`,
+    );
+  }
+}
+
+/**
+ * Parse a sendMessage response body. The endpoint returns an empty body / `{}`
+ * on success and `{ret,errcode,errmsg}` on rejection. Returns null when the
+ * body is empty or not JSON, which is treated as success so an unexpected but
+ * benign body never fails a send the server actually accepted.
+ */
+function parseSendMessageResp(rawText: string): SendMessageResp | null {
+  const trimmed = rawText.trim();
+  if (!trimmed) return null;
+  try {
+    return JSON.parse(trimmed) as SendMessageResp;
+  } catch {
+    logger.debug(`sendMessage: non-JSON response body: ${redactBody(rawText)}`);
+    return null;
+  }
 }
 
 /** Fetch bot config (includes typing_ticket) for a given user. */

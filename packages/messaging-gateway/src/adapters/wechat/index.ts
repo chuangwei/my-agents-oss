@@ -45,6 +45,8 @@ import {
 import { sendMessageWeixin } from './ilink/messaging/send'
 import { sendWeixinMediaFile } from './ilink/messaging/send-media'
 import { downloadMediaFromItem } from './ilink/media/media-download'
+import { getConfig, sendTyping } from './ilink/api/api'
+import { TypingStatus } from './ilink/api/types'
 import type { WeixinMessage } from './ilink/api/types'
 
 // ---------------------------------------------------------------------------
@@ -167,6 +169,20 @@ const MAX_MESSAGE_LENGTH = 4000
  */
 const COALESCE_WINDOW_MS = 10_000
 
+/**
+ * Heartbeat-typing interval. iLink has a hard per-turn reply deadline: if the
+ * bot is silent until the final answer, a slow run (web search + compose) blows
+ * it and the server shows the user "请稍后再试。", dropping the late reply. The
+ * official iLink mechanism (mirrors @tencent-weixin/openclaw-weixin's
+ * createReplyDispatcherWithTyping keepaliveIntervalMs) is to send a typing
+ * indicator on a heartbeat — it holds the turn open WITHOUT posting any visible
+ * bubble. 5s matches upstream and stays under the deadline.
+ */
+const TYPING_HEARTBEAT_INTERVAL_MS = 5_000
+
+/** Safety cap so a run that never replies can't keep typing forever (~5 min). */
+const TYPING_HEARTBEAT_MAX_TICKS = 60
+
 export class WeChatAdapter implements PlatformAdapter {
   readonly platform = 'wechat' as const
   readonly capabilities: AdapterCapabilities = {
@@ -193,6 +209,16 @@ export class WeChatAdapter implements PlatformAdapter {
     string,
     { msgs: WeixinMessage[]; timer: ReturnType<typeof setTimeout> }
   >()
+  /**
+   * Per-user heartbeat-typing timers that hold the iLink turn open during slow
+   * runs by re-sending a typing indicator every {@link TYPING_HEARTBEAT_INTERVAL_MS}.
+   */
+  private readonly typingHeartbeats = new Map<
+    string,
+    { timer: ReturnType<typeof setInterval>; ticks: number }
+  >()
+  /** Per-user cached typing_ticket (from getConfig), required by sendTyping. */
+  private readonly typingTickets = new Map<string, string>()
 
   async initialize(config: PlatformConfig): Promise<void> {
     if (!config.token) throw new Error('WeChat adapter requires credentials in config.token')
@@ -243,6 +269,7 @@ export class WeChatAdapter implements PlatformAdapter {
     this.abort = undefined
     for (const entry of this.pending.values()) clearTimeout(entry.timer)
     this.pending.clear()
+    for (const channelId of [...this.typingHeartbeats.keys()]) this.stopTypingHeartbeat(channelId)
   }
 
   isConnected(): boolean {
@@ -263,6 +290,10 @@ export class WeChatAdapter implements PlatformAdapter {
   }
 
   async sendText(channelId: string, text: string, _opts?: SendOptions): Promise<SentMessage> {
+    // The renderer only ever sends the final answer for WeChat (it stays silent
+    // during the run), so any send here is the reply that closes the turn — end
+    // the heartbeat typing and cancel the indicator before sending.
+    this.stopTypingHeartbeat(channelId)
     const plain = stripMarkdownForWeChat(text)
     const { messageId } = await sendMessageWeixin({
       to: channelId,
@@ -419,6 +450,81 @@ export class WeChatAdapter implements PlatformAdapter {
     await this.dispatchBatch(entry.msgs)
   }
 
+  /**
+   * Resolve (and cache per user) the typing_ticket required by sendTyping. The
+   * ticket comes from getConfig and is reusable across turns; returns undefined
+   * if the lookup fails (callers then skip typing rather than erroring).
+   */
+  private async getTypingTicket(channelId: string): Promise<string | undefined> {
+    const cached = this.typingTickets.get(channelId)
+    if (cached) return cached
+    try {
+      const resp = await getConfig({
+        baseUrl: this.baseUrl,
+        token: this.token,
+        ilinkUserId: channelId,
+        contextToken: getContextToken(this.accountId, channelId),
+      })
+      const ticket = resp.typing_ticket
+      if (ticket) this.typingTickets.set(channelId, ticket)
+      return ticket
+    } catch (err) {
+      this.logger?.error(`wechat getConfig (typing_ticket) failed: ${String(err)}`, {
+        event: 'wechat_typing_ticket_failed',
+      })
+      return undefined
+    }
+  }
+
+  /**
+   * Start heartbeat typing to hold the iLink turn open while the agent works.
+   * Sends a typing indicator immediately (the agent's first event can be several
+   * seconds out) then every {@link TYPING_HEARTBEAT_INTERVAL_MS} until the reply
+   * is sent (see {@link sendText}) or the safety cap hits. This is the official
+   * mechanism — it keeps the turn alive WITHOUT posting any visible bubble.
+   */
+  private startTypingHeartbeat(channelId: string): void {
+    if (this.typingHeartbeats.has(channelId)) return
+    const entry: { timer: ReturnType<typeof setInterval>; ticks: number } = {
+      timer: setInterval(() => {
+        entry.ticks += 1
+        if (entry.ticks > TYPING_HEARTBEAT_MAX_TICKS) {
+          this.stopTypingHeartbeat(channelId)
+          return
+        }
+        void this.sendTypingPing(channelId, TypingStatus.TYPING)
+      }, TYPING_HEARTBEAT_INTERVAL_MS),
+      ticks: 0,
+    }
+    this.typingHeartbeats.set(channelId, entry)
+    void this.sendTypingPing(channelId, TypingStatus.TYPING)
+  }
+
+  private stopTypingHeartbeat(channelId: string): void {
+    const entry = this.typingHeartbeats.get(channelId)
+    if (!entry) return
+    clearInterval(entry.timer)
+    this.typingHeartbeats.delete(channelId)
+    // Best-effort cancel so the "typing…" indicator clears once we reply.
+    void this.sendTypingPing(channelId, TypingStatus.CANCEL)
+  }
+
+  private async sendTypingPing(channelId: string, status: number): Promise<void> {
+    const ticket = await this.getTypingTicket(channelId)
+    if (!ticket) return
+    try {
+      await sendTyping({
+        baseUrl: this.baseUrl,
+        token: this.token,
+        body: { ilink_user_id: channelId, typing_ticket: ticket, status },
+      })
+    } catch (err) {
+      this.logger?.error(`wechat sendTyping failed: ${String(err)}`, {
+        event: 'wechat_typing_failed',
+      })
+    }
+  }
+
   /** Merge one or more buffered WeChat messages into a single IncomingMessage. */
   private async dispatchBatch(msgs: WeixinMessage[]): Promise<void> {
     if (!this.messageHandler || msgs.length === 0) return
@@ -447,6 +553,9 @@ export class WeChatAdapter implements PlatformAdapter {
       raw: msgs,
     }
 
+    // Hold the iLink turn open with heartbeat typing while the agent works;
+    // stopped when the reply is sent (see sendText) or by the safety cap.
+    this.startTypingHeartbeat(from)
     await this.messageHandler(incoming)
   }
 
