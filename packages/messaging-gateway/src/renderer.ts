@@ -438,9 +438,12 @@ export class Renderer {
     adapter: PlatformAdapter,
     status: string,
   ): Promise<void> {
-    if (binding.platform === 'lark') {
-      // Lark/Feishu uses a lightweight reaction on the user's original
-      // message ("GET") instead of posting a separate progress bubble.
+    if (binding.platform === 'lark' || binding.platform === 'wechat') {
+      // Lark/Feishu uses a lightweight reaction instead of a progress bubble.
+      // WeChat's iLink protocol accepts only ONE reply per user turn — a second
+      // message (progress bubble + final answer) makes the server drop the real
+      // reply and show "请稍后再试。". Both skip the separate progress bubble and
+      // deliver a single message on `complete`.
       void status
       return
     }
