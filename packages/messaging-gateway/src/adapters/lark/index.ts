@@ -38,6 +38,7 @@ import {
   isLarkEditExpiredError,
   LARK_MAX_BUTTONS,
 } from './card'
+import { SeenMessageStore } from '../../seen-message-store'
 
 /**
  * Hard cap for downloaded attachment size. Matches Telegram's MAX_ATTACHMENT_BYTES
@@ -45,7 +46,6 @@ import {
  * we fail fast in the adapter with a user-visible reply.
  */
 const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024
-const DEDUP_MAX = 1000
 
 const NOOP_LOGGER: MessagingLogger = {
   info: () => {},
@@ -268,7 +268,7 @@ export class LarkAdapter implements PlatformAdapter {
   private buttonHandler: ((press: ButtonPress) => Promise<void>) | null = null
   private connected = false
   private log: MessagingLogger = NOOP_LOGGER
-  private seenMessageIds = new Set<string>()
+  private readonly seenStore: SeenMessageStore
   /**
    * Track each outbound message's wire `msg_type` so `editMessage` can dispatch
    * to `update` (text/post) vs `patch` (interactive card) correctly. Lark
@@ -276,6 +276,12 @@ export class LarkAdapter implements PlatformAdapter {
    */
   private sentMsgTypes = new Map<string, 'text' | 'post' | 'interactive'>()
   private receivedReactionIds = new Map<string, string>()
+
+  constructor(seenStore?: SeenMessageStore) {
+    // storageDir omitted → in-memory only: keeps no-arg construction working
+    // for tests and as a safe fallback when no messaging dir is available.
+    this.seenStore = seenStore ?? new SeenMessageStore()
+  }
 
   async markMessageReceived(msg: IncomingMessage): Promise<void> {
     if (!this.client || !msg.messageId) return
@@ -423,7 +429,7 @@ export class LarkAdapter implements PlatformAdapter {
     this.client = null
     this.connected = false
     this.sentMsgTypes.clear()
-    this.seenMessageIds.clear()
+    this.seenStore.flush()
     this.receivedReactionIds.clear()
   }
 
@@ -785,7 +791,7 @@ export class LarkAdapter implements PlatformAdapter {
       messageId: message.message_id,
     })
 
-    if (this.seenMessageIds.has(message.message_id)) {
+    if (this.seenStore.has(message.message_id)) {
       this.log.info('[lark] dropped duplicate event', {
         event: 'lark_duplicate_event',
         chatId: message.chat_id,
@@ -793,7 +799,7 @@ export class LarkAdapter implements PlatformAdapter {
       })
       return
     }
-    this.rememberMessageId(message.message_id)
+    this.seenStore.add(message.message_id)
 
     const senderId =
       sender.sender_id?.user_id ?? sender.sender_id?.open_id ?? sender.sender_id?.union_id ?? ''
@@ -993,19 +999,6 @@ export class LarkAdapter implements PlatformAdapter {
       ...(value.data !== undefined ? { data: value.data } : {}),
     }
     await this.buttonHandler(press)
-  }
-
-  private rememberMessageId(messageId: string): void {
-    this.seenMessageIds.add(messageId)
-    if (this.seenMessageIds.size <= DEDUP_MAX) return
-
-    const overflow = this.seenMessageIds.size - DEDUP_MAX
-    let removed = 0
-    for (const staleId of this.seenMessageIds) {
-      this.seenMessageIds.delete(staleId)
-      removed++
-      if (removed >= overflow) break
-    }
   }
 
   private dispatchIncomingMessage(msg: IncomingMessage): void {

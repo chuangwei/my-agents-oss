@@ -9,9 +9,13 @@
  * End-to-end behaviour (event dispatch, send/edit roundtrips) is verified
  * via manual smoke against a real Lark Custom App.
  */
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { describe, expect, it } from 'bun:test'
 import { parseLarkCredentials, LarkAdapter } from '../adapters/lark/index'
 import type { IncomingMessage } from '../types'
+import { SeenMessageStore } from '../seen-message-store'
 
 describe('parseLarkCredentials', () => {
   it('parses a valid JSON-encoded credential blob', () => {
@@ -116,6 +120,60 @@ describe('LarkAdapter — static contract', () => {
     expect(received).toHaveLength(1)
     expect(received[0]?.text).toBe('hello')
     expect(received[0]?.messageId).toBe('om_duplicate')
+  })
+
+  it('persists dedup across adapter instances via a shared SeenMessageStore', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'lark-adapter-seen-'))
+    try {
+      const buildAdapter = () => {
+        const adapter = new LarkAdapter(new SeenMessageStore(dir))
+        const received: IncomingMessage[] = []
+        adapter.onMessage(async (msg) => {
+          received.push(msg)
+        })
+        const handle = (
+          adapter as unknown as {
+            handleIncomingMessage: (event: {
+              sender: { sender_id: { open_id: string } }
+              message: {
+                message_id: string
+                chat_id: string
+                chat_type: string
+                message_type: string
+                content: string
+                create_time: string
+              }
+            }) => Promise<void>
+          }
+        ).handleIncomingMessage.bind(adapter)
+        return { adapter, received, handle }
+      }
+
+      const event = {
+        sender: { sender_id: { open_id: 'ou_1' } },
+        message: {
+          message_id: 'om_persist',
+          chat_id: 'oc_1',
+          chat_type: 'p2p',
+          message_type: 'text',
+          content: JSON.stringify({ text: 'hello' }),
+          create_time: '1779782400000',
+        },
+      }
+
+      // First instance processes the message, then "shuts down" (flush to disk).
+      const first = buildAdapter()
+      await first.handle(event)
+      expect(first.received).toHaveLength(1)
+      await first.adapter.destroy()
+
+      // Second instance (simulating a process restart) must drop the redelivery.
+      const second = buildAdapter()
+      await second.handle(event)
+      expect(second.received).toHaveLength(0)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
   })
 
   it('acks inbound text events without waiting for the message handler to finish', async () => {
