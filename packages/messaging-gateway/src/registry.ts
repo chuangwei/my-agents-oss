@@ -27,6 +27,7 @@ import type {
 import { MessagingGateway } from './gateway'
 import { ConfigStore } from './config-store'
 import { PairingCodeManager } from './pairing'
+import { SeenMessageStore } from './seen-message-store'
 import { TelegramAdapter } from './adapters/telegram/index'
 import { WhatsAppAdapter, type WhatsAppEvent } from './adapters/whatsapp/index'
 import { LarkAdapter, parseLarkCredentials, type LarkCredentials } from './adapters/lark/index'
@@ -1093,7 +1094,11 @@ export class MessagingGatewayRegistry implements IMessagingGatewayRegistry {
     })
 
     try {
-      const adapter = new LarkAdapter()
+      const seenStore = new SeenMessageStore(
+        this.opts.getMessagingDir(workspaceId),
+        this.log.child({ component: 'lark-seen-store', workspaceId, platform: 'lark' }),
+      )
+      const adapter = new LarkAdapter(seenStore)
       await adapter.initialize({
         token: cred.value,
         logger: this.log.child({
