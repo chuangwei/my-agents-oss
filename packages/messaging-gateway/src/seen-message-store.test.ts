@@ -1,12 +1,23 @@
-import { describe, expect, it } from 'bun:test'
+import { afterEach, describe, expect, it } from 'bun:test'
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { SeenMessageStore } from './seen-message-store'
 
+const testDirs: string[] = []
+
 function tmpDir(): string {
-  return mkdtempSync(join(tmpdir(), 'lark-seen-'))
+  const dir = mkdtempSync(join(tmpdir(), 'lark-seen-'))
+  testDirs.push(dir)
+  return dir
 }
+
+afterEach(() => {
+  for (const dir of testDirs) {
+    if (existsSync(dir)) rmSync(dir, { recursive: true, force: true })
+  }
+  testDirs.length = 0
+})
 
 describe('SeenMessageStore', () => {
   it('records and recognizes message ids (in-memory mode)', () => {
@@ -29,7 +40,6 @@ describe('SeenMessageStore', () => {
     expect(b.has('m1')).toBe(true)
     expect(b.has('m2')).toBe(true)
     expect(b.has('m3')).toBe(false)
-    rmSync(dir, { recursive: true, force: true })
   })
 
   it('prunes entries older than the TTL on load', () => {
@@ -44,7 +54,6 @@ describe('SeenMessageStore', () => {
     const store = new SeenMessageStore(dir)
     expect(store.has('old')).toBe(false)
     expect(store.has('fresh')).toBe(true)
-    rmSync(dir, { recursive: true, force: true })
   })
 
   it('expires entries at runtime once past the TTL', async () => {
@@ -74,6 +83,5 @@ describe('SeenMessageStore', () => {
     expect(store.has('anything')).toBe(false)
     store.add('m1')
     expect(store.has('m1')).toBe(true)
-    rmSync(dir, { recursive: true, force: true })
   })
 })

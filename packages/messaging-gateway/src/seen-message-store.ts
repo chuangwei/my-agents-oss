@@ -73,8 +73,9 @@ export class SeenMessageStore {
   /** Record a message_id as seen (mark-on-receipt). No-op if already present. */
   add(messageId: string): void {
     if (this.entries.has(messageId)) return
-    this.entries.set(messageId, Date.now())
-    this.evict(Date.now())
+    const now = Date.now()
+    this.entries.set(messageId, now)
+    this.evict(now)
     this.scheduleSave()
   }
 
@@ -121,7 +122,7 @@ export class SeenMessageStore {
         }
       }
     } catch (err) {
-      this.log.warn('failed to load seen messages; resetting', {
+      this.log.error('failed to load seen messages; resetting', {
         event: 'lark_seen_load_failed',
         filePath: this.filePath,
         error: err,
@@ -146,7 +147,7 @@ export class SeenMessageStore {
       }
       writeFileSync(this.filePath, JSON.stringify([...this.entries.entries()]), 'utf-8')
     } catch (err) {
-      this.log.warn('failed to save seen messages', {
+      this.log.error('failed to save seen messages', {
         event: 'lark_seen_save_failed',
         filePath: this.filePath,
         error: err,
