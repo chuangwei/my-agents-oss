@@ -276,6 +276,9 @@ export class Renderer {
       }
 
       case 'tool_start': {
+        // WeChat accepts only one reply per turn — never post an intermediate
+        // bubble (see ensureProgressBubble for the progress-mode equivalent).
+        if (binding.platform === 'wechat') break
         if (binding.config.showToolActivity) {
           const toolName = typeof event.toolName === 'string' ? event.toolName : 'tool'
           const displayName =

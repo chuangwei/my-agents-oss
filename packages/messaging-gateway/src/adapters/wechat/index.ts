@@ -40,6 +40,7 @@ import {
   isMediaItem,
   setContextToken,
   getContextToken,
+  restoreContextTokens,
 } from './ilink/messaging/inbound'
 import { sendMessageWeixin } from './ilink/messaging/send'
 import { sendWeixinMediaFile } from './ilink/messaging/send-media'
@@ -88,7 +89,7 @@ export type WeChatLoginEvent =
   | { type: 'qr'; qr: string }
   | { type: 'scanned' }
   | { type: 'need_verifycode' }
-  | { type: 'connected'; credentials: WeChatCredentials }
+  | { type: 'connected'; credentials?: WeChatCredentials }
   | { type: 'error'; message: string }
 
 /**
@@ -100,7 +101,7 @@ export async function startWeChatQrLogin(opts: {
   onEvent: (event: WeChatLoginEvent) => void
   verifyCodeProvider?: () => Promise<string>
   timeoutMs?: number
-}): Promise<WeChatCredentials | null> {
+}): Promise<WeChatCredentials | 'already-connected' | null> {
   const start = await startWeixinLoginWithQr({ apiBaseUrl: DEFAULT_BASE_URL })
   if (!start.qrcodeUrl) {
     opts.onEvent({ type: 'error', message: start.message })
@@ -119,14 +120,24 @@ export async function startWeChatQrLogin(opts: {
     },
   })
 
-  if (!result.connected || !result.accountId) {
+  // The scanned bot is already bound to this instance — no new credentials are
+  // issued, but the existing connection is valid. Treat as success (the caller
+  // reconnects from the stored credential) rather than a login failure.
+  if (result.alreadyConnected) {
+    opts.onEvent({ type: 'connected' })
+    return 'already-connected'
+  }
+
+  // Require a usable token — storing an empty token would fail to parse on the
+  // next startup ("WeChat credentials missing token").
+  if (!result.connected || !result.accountId || !result.botToken) {
     opts.onEvent({ type: 'error', message: result.message })
     return null
   }
 
   const credentials: WeChatCredentials = {
     accountId: result.accountId,
-    token: result.botToken ?? '',
+    token: result.botToken,
     baseUrl: result.baseUrl || DEFAULT_BASE_URL,
     userId: result.userId,
   }
@@ -199,6 +210,10 @@ export class WeChatAdapter implements PlatformAdapter {
       userId: this.userId,
     })
     registerWeixinAccountId(this.accountId)
+    // Restore per-user context tokens from disk so replies not directly
+    // preceded by an inbound this process (e.g. across a restart) still carry a
+    // valid context_token, which iLink requires for delivery.
+    restoreContextTokens(this.accountId)
 
     this.abort = new AbortController()
     this.connected = true
@@ -365,7 +380,7 @@ export class WeChatAdapter implements PlatformAdapter {
         await this.flushPending(from)
       } else {
         // More media — keep waiting for a possible caption.
-        entry.timer = setTimeout(() => void this.flushPending(from), COALESCE_WINDOW_MS)
+        entry.timer = this.scheduleFlush(from)
       }
       return
     }
@@ -374,13 +389,26 @@ export class WeChatAdapter implements PlatformAdapter {
       // Media-only: WeChat sends an image and its caption as separate messages.
       // Buffer briefly so a following text merges into one turn (one reply)
       // instead of triggering a second turn.
-      const timer = setTimeout(() => void this.flushPending(from), COALESCE_WINDOW_MS)
+      const timer = this.scheduleFlush(from)
       this.pending.set(from, { msgs: [msg], timer })
       return
     }
 
     // Standalone text (or a single message already carrying everything): no delay.
     await this.dispatchBatch([msg])
+  }
+
+  /** Schedule a coalesce flush with proper error handling (the timer callback
+   *  runs outside the monitor's try/catch, so a throw here would otherwise be
+   *  an unhandled rejection). */
+  private scheduleFlush(from: string): ReturnType<typeof setTimeout> {
+    return setTimeout(() => {
+      void this.flushPending(from).catch((err) =>
+        this.logger?.error(`wechat coalesce flush failed: ${String(err)}`, {
+          event: 'wechat_coalesce_flush_failed',
+        }),
+      )
+    }, COALESCE_WINDOW_MS)
   }
 
   private async flushPending(from: string): Promise<void> {

@@ -1148,9 +1148,13 @@ export class MessagingGatewayRegistry implements IMessagingGatewayRegistry {
     })
 
     const verifyResolvers: Array<(code: string) => void> = []
+    // Unblock any prior in-flight login for this workspace so it settles instead
+    // of hanging on its verify-code waiter until the long-poll timeout.
+    const prior = this.wechatVerifyResolvers.get(workspaceId)
+    if (prior) for (const resolve of prior.splice(0)) resolve('')
     this.wechatVerifyResolvers.set(workspaceId, verifyResolvers)
 
-    const credentials = await startWeChatQrLogin({
+    const result = await startWeChatQrLogin({
       onEvent: (event: WeChatLoginEvent) => {
         this.opts.publishEvent?.(
           RPC_CHANNELS.messaging.WECHAT_UI_EVENT,
@@ -1171,14 +1175,25 @@ export class MessagingGatewayRegistry implements IMessagingGatewayRegistry {
           verifyResolvers.push(resolve)
         }),
     }).finally(() => {
-      this.wechatVerifyResolvers.delete(workspaceId)
+      // Only clear if we're still the active login — a newer connect may have
+      // replaced our resolver array.
+      if (this.wechatVerifyResolvers.get(workspaceId) === verifyResolvers) {
+        this.wechatVerifyResolvers.delete(workspaceId)
+      }
     })
 
-    if (!credentials) return
+    if (!result) return
+
+    // Already bound to this instance — reconnect from the stored credential.
+    if (result === 'already-connected') {
+      await this.tryConnectWeChat(workspaceId, state)
+      await state.gateway.start()
+      return
+    }
 
     await this.opts.credentialManager.set(
       { type: 'messaging_bearer', workspaceId, name: 'wechat' },
-      { value: JSON.stringify(credentials) },
+      { value: JSON.stringify(result) },
     )
     state.configStore.update({
       enabled: true,
