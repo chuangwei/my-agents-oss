@@ -34,6 +34,14 @@ export interface StdioMcpClientConfig {
 export type McpClientConfig = HttpMcpClientConfig | StdioMcpClientConfig;
 
 /**
+ * Per-request timeout for MCP SDK calls (callTool, listTools). The SDK default
+ * is 60s, which is too short for tools that wrap long-running operations and
+ * for cold-starting servers that take a while to respond to the first
+ * tools/list. 5 minutes covers both without leaving sessions hung forever.
+ */
+export const MCP_REQUEST_TIMEOUT_MS = 300_000;
+
+/**
  * Sensitive environment variables that should NOT be passed to MCP subprocesses.
  * These could contain API keys, tokens, or credentials that MCP servers don't need
  * and shouldn't have access to.
@@ -115,7 +123,7 @@ export class CraftMcpClient {
 
     // Verify connection works by listing tools
     try {
-      await this.client.listTools();
+      await this.client.listTools(undefined, { timeout: MCP_REQUEST_TIMEOUT_MS });
     } catch (error) {
       await this.client.close();
       throw new Error(
@@ -131,7 +139,7 @@ export class CraftMcpClient {
       await this.connect();
     }
 
-    const result = await this.client.listTools();
+    const result = await this.client.listTools(undefined, { timeout: MCP_REQUEST_TIMEOUT_MS });
     return result.tools;
   }
 
@@ -150,7 +158,11 @@ export class CraftMcpClient {
       await this.connect();
     }
 
-    const result = await this.client.callTool({ name, arguments: args });
+    const result = await this.client.callTool(
+      { name, arguments: args },
+      undefined,
+      { timeout: MCP_REQUEST_TIMEOUT_MS },
+    );
     return result;
   }
 

@@ -10,7 +10,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { Tool } from '@modelcontextprotocol/sdk/types.js';
-import type { PoolClient } from './client.ts';
+import { MCP_REQUEST_TIMEOUT_MS, type PoolClient } from './client.ts';
 
 export class ApiSourcePoolClient implements PoolClient {
   private client: Client;
@@ -34,13 +34,17 @@ export class ApiSourcePoolClient implements PoolClient {
 
   async listTools(): Promise<Tool[]> {
     if (!this.connected) await this.connect();
-    const result = await this.client.listTools();
+    const result = await this.client.listTools(undefined, { timeout: MCP_REQUEST_TIMEOUT_MS });
     return result.tools;
   }
 
   async callTool(name: string, args: Record<string, unknown>): Promise<unknown> {
     if (!this.connected) await this.connect();
-    return this.client.callTool({ name, arguments: args });
+    return this.client.callTool(
+      { name, arguments: args },
+      undefined,
+      { timeout: MCP_REQUEST_TIMEOUT_MS },
+    );
   }
 
   async close(): Promise<void> {
