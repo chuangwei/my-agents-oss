@@ -455,6 +455,7 @@ app.whenReady().then(async () => {
     browserPaneManager = new BrowserPaneManager()
     browserPaneManager.setWindowManager(windowManager)
     browserPaneManager.registerToolbarIpc()
+    browserPaneManager.registerCapabilityIpc()
 
     // Build real PlatformServices from Electron APIs
     const platform: PlatformServices = createElectronPlatform({
@@ -635,6 +636,7 @@ app.whenReady().then(async () => {
           sm.setBrowserPaneManager(browserPaneManager!)
           return sm
         },
+        bindRpcServer: (sm, server) => sm.setRpcServer(server),
         createHandlerDeps: ({ sessionManager: sm, platform: p, oauthFlowStore: ofs }) => {
           // The messaging handle is built here because it needs sessionManager.
           // The WS publisher is attached after bootstrapServer resolves (via
