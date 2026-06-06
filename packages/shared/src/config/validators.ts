@@ -20,6 +20,8 @@ import { safeJsonParse, readJsonFileSync } from '../utils/files.ts';
 import { EntityColorSchema } from '../colors/validate.ts';
 import { THINKING_LEVEL_IDS } from '../agent/thinking-levels.ts';
 import { isValidProviderAuthCombination } from './llm-connections.ts';
+import { SUPPORTED_LANGUAGE_CODES } from '../i18n/languages.ts';
+import type { LanguageCode } from '../i18n/languages.ts';
 
 // ============================================================
 // Config Directory
@@ -117,10 +119,12 @@ export const UserPreferencesSchema = z.object({
   name: z.string().optional(),
   timezone: z.string().optional(),  // TODO: Could validate against IANA timezone list
   location: LocationSchema.optional(),
-  language: z.string().optional(),
   notes: z.string().optional(),
+  // Internal: mirrors Appearance → Language. Not user-editable.
+  // Validated against the registry-derived supported set.
+  uiLanguage: z.enum([...SUPPORTED_LANGUAGE_CODES] as [LanguageCode, ...LanguageCode[]]).optional(),
   updatedAt: z.number().int().min(0).optional(),
-});
+}).passthrough();
 
 // ============================================================
 // Validation Functions
