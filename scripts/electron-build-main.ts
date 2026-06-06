@@ -4,11 +4,21 @@
  */
 
 import { spawn } from "bun";
-import { existsSync, readFileSync, statSync, mkdirSync } from "fs";
+import {
+  copyFileSync,
+  cpSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  statSync,
+} from "fs";
 import { join } from "path";
 
 const ROOT_DIR = join(import.meta.dir, "..");
 const DIST_DIR = join(ROOT_DIR, "apps/electron/dist");
+const ELECTRON_RESOURCES_DIR = join(ROOT_DIR, "apps/electron/resources");
 const OUTPUT_FILE = join(DIST_DIR, "main.cjs");
 const INTERCEPTOR_SOURCE = join(ROOT_DIR, "packages/shared/src/unified-network-interceptor.ts");
 const INTERCEPTOR_OUTPUT = join(DIST_DIR, "interceptor.cjs");
@@ -134,6 +144,83 @@ function verifySessionToolsCore(): void {
   }
 
   console.log("✅ Session tools core verified");
+}
+
+function targetBuildPlatform(): NodeJS.Platform {
+  return (process.env.CRAFT_BUILD_PLATFORM as NodeJS.Platform | undefined) ?? process.platform;
+}
+
+function targetBuildArch(): "x64" | "arm64" {
+  const arch = process.env.CRAFT_BUILD_ARCH ?? process.arch;
+  if (arch !== "x64" && arch !== "arm64") {
+    console.error("❌ Unsupported Electron build arch:", arch);
+    process.exit(1);
+  }
+  return arch;
+}
+
+function koffiPlatformDir(platform: NodeJS.Platform, arch: "x64" | "arm64"): string {
+  return `${platform}_${arch}`;
+}
+
+function stageSessionServer(): void {
+  const destDir = join(ELECTRON_RESOURCES_DIR, "session-mcp-server");
+  const destPath = join(destDir, "index.js");
+
+  console.log("📦 Staging Session MCP Server...");
+  rmSync(destDir, { recursive: true, force: true });
+  mkdirSync(destDir, { recursive: true });
+  copyFileSync(SESSION_SERVER_OUTPUT, destPath);
+}
+
+function stagePiAgentServer(): void {
+  if (!existsSync(PI_AGENT_SERVER_OUTPUT)) {
+    console.log("⏭️  Pi agent server staging skipped (output not found)");
+    return;
+  }
+
+  const platform = targetBuildPlatform();
+  const arch = targetBuildArch();
+  const targetDir = koffiPlatformDir(platform, arch);
+  const destDir = join(ELECTRON_RESOURCES_DIR, "pi-agent-server");
+
+  console.log(`📦 Staging Pi Agent Server (${targetDir})...`);
+  rmSync(destDir, { recursive: true, force: true });
+  mkdirSync(destDir, { recursive: true });
+  copyFileSync(PI_AGENT_SERVER_OUTPUT, join(destDir, "index.js"));
+
+  // The Pi bundle externalizes koffi because it is a native N-API module.
+  // Ship only the target platform binary so packaged builds work cross-arch.
+  const koffiSource = join(ROOT_DIR, "node_modules", "koffi");
+  if (!existsSync(koffiSource)) {
+    console.warn("  ⚠️ koffi not found in node_modules. Pi SDK sessions may not work.");
+    return;
+  }
+
+  const koffiDest = join(destDir, "node_modules", "koffi");
+  mkdirSync(koffiDest, { recursive: true });
+
+  for (const entry of ["package.json", "index.js", "indirect.js", "index.d.ts", "lib"]) {
+    const src = join(koffiSource, entry);
+    if (existsSync(src)) {
+      cpSync(src, join(koffiDest, entry), { recursive: true });
+    }
+  }
+
+  const nativeSrc = join(koffiSource, "build", "koffi", targetDir);
+  const nativeDest = join(koffiDest, "build", "koffi", targetDir);
+  if (existsSync(nativeSrc)) {
+    mkdirSync(nativeDest, { recursive: true });
+    cpSync(nativeSrc, nativeDest, { recursive: true });
+    const [nativeFile] = readdirSync(nativeSrc);
+    if (nativeFile) {
+      const size = statSync(join(nativeSrc, nativeFile)).size;
+      console.log(`  Copied koffi/${targetDir} (${(size / 1024 / 1024).toFixed(1)} MB)`);
+    }
+  } else {
+    console.warn(`  ⚠️ koffi native binary not found for ${targetDir}; copying all native builds as fallback`);
+    cpSync(join(koffiSource, "build"), join(koffiDest, "build"), { recursive: true });
+  }
 }
 
 // Build the unified network interceptor (bundled CJS loaded via --require into Node-based SDK subprocesses)
@@ -324,9 +411,11 @@ async function main(): Promise<void> {
   // Build session server (provides session-scoped tools like SubmitPlan)
   // Depends on session-tools-core being built first
   await buildSessionServer();
+  stageSessionServer();
 
   // Build Pi agent server (subprocess for Pi SDK sessions)
   await buildPiAgentServer();
+  stagePiAgentServer();
 
   // Build unified network interceptor (CJS bundle for Node.js --require)
   await buildInterceptor();

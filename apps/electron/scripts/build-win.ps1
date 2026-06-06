@@ -241,7 +241,62 @@ foreach ($dep in @("interceptor-common.ts", "feature-flags.ts", "interceptor-req
     }
 }
 
-# 6. Build Electron app
+# 6. Build and stage subprocess servers
+Write-Host "Building subprocess servers..."
+$SessionServerOut = "$RootDir\packages\session-mcp-server\dist\index.js"
+$PiServerOut = "$RootDir\packages\pi-agent-server\dist\index.js"
+
+New-Item -ItemType Directory -Force -Path "$RootDir\packages\session-mcp-server\dist" | Out-Null
+bun build "$RootDir\packages\session-mcp-server\src\index.ts" --outfile "$SessionServerOut" --target node --format cjs
+if (-not (Test-Path $SessionServerOut)) {
+    Write-Host "ERROR: Session MCP server output not found at $SessionServerOut" -ForegroundColor Red
+    exit 1
+}
+
+New-Item -ItemType Directory -Force -Path "$RootDir\packages\pi-agent-server\dist" | Out-Null
+bun build "$RootDir\packages\pi-agent-server\src\index.ts" --outfile "$PiServerOut" --target bun --format esm --external koffi
+if (-not (Test-Path $PiServerOut)) {
+    Write-Host "ERROR: Pi agent server output not found at $PiServerOut" -ForegroundColor Red
+    exit 1
+}
+
+Write-Host "Staging subprocess servers..."
+$SessionDest = "$ElectronDir\resources\session-mcp-server"
+$PiDest = "$ElectronDir\resources\pi-agent-server"
+
+Remove-Item -Recurse -Force $SessionDest -ErrorAction SilentlyContinue
+New-Item -ItemType Directory -Force -Path $SessionDest | Out-Null
+Copy-Item $SessionServerOut "$SessionDest\index.js"
+
+Remove-Item -Recurse -Force $PiDest -ErrorAction SilentlyContinue
+New-Item -ItemType Directory -Force -Path $PiDest | Out-Null
+Copy-Item $PiServerOut "$PiDest\index.js"
+
+$KoffiSource = "$RootDir\node_modules\koffi"
+if (Test-Path $KoffiSource) {
+    $KoffiDest = "$PiDest\node_modules\koffi"
+    New-Item -ItemType Directory -Force -Path $KoffiDest | Out-Null
+    foreach ($entry in @("package.json", "index.js", "indirect.js", "index.d.ts", "lib")) {
+        $src = "$KoffiSource\$entry"
+        if (Test-Path $src) {
+            Copy-Item -Recurse -Force $src "$KoffiDest\"
+        }
+    }
+
+    $NativeSrc = "$KoffiSource\build\koffi\win32_x64"
+    $NativeDest = "$KoffiDest\build\koffi\win32_x64"
+    if (Test-Path $NativeSrc) {
+        New-Item -ItemType Directory -Force -Path $NativeDest | Out-Null
+        Copy-Item -Recurse -Force "$NativeSrc\*" $NativeDest
+    } else {
+        Write-Host "Warning: koffi native binary not found for win32_x64; copying all native builds"
+        Copy-Item -Recurse -Force "$KoffiSource\build" "$KoffiDest\"
+    }
+} else {
+    Write-Host "Warning: koffi not found in node_modules. Pi SDK sessions may not work."
+}
+
+# 7. Build Electron app
 Write-Host "Building Electron app..."
 
 # Build main process with OAuth credentials
