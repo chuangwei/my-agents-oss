@@ -166,6 +166,79 @@ function stripMarkdownForLarkText(text: string): string {
 }
 
 /**
+ * A single inline node inside a Lark `post` (rich-text) message. Lark nests
+ * paragraphs as `content: Node[][]` — an array of lines, each an array of
+ * inline runs. We only consume the handful of tags that carry user intent.
+ */
+interface LarkPostNode {
+  tag?: string
+  text?: string
+  href?: string
+  image_key?: string
+  user_name?: string
+}
+
+/**
+ * Flatten a Lark `post` message's JSON content into plain text + the
+ * `image_key`s of any embedded screenshots/images.
+ *
+ * This is the inbound counterpart to `formatForLarkPost` (outbound). It exists
+ * because Feishu sends "screenshot + caption" (and any image-with-text) as a
+ * `post` message — NOT as `image`/`text` — so without this the whole message
+ * was being dropped as an unsupported type.
+ *
+ * Tag handling:
+ *  - `text` → kept verbatim
+ *  - `a`    → rendered as `label (href)` so the URL survives for the agent
+ *  - `img`  → `image_key` collected for download (text drops the node)
+ *  - `at`   → dropped (mirrors `stripMentionPrefix` for text messages — the
+ *             agent doesn't need the @bot mention noise)
+ *  - other  → ignored (emotion stickers, etc.)
+ */
+export function parseLarkPostContent(rawContent: string): { text: string; imageKeys: string[] } {
+  let parsed: { title?: unknown; content?: unknown }
+  try {
+    parsed = JSON.parse(rawContent)
+  } catch {
+    return { text: '', imageKeys: [] }
+  }
+
+  const imageKeys: string[] = []
+  const lines: string[] = []
+  const rows = Array.isArray(parsed.content) ? (parsed.content as unknown[]) : []
+
+  for (const row of rows) {
+    const parts: string[] = []
+    for (const rawNode of Array.isArray(row) ? (row as unknown[]) : []) {
+      const node = (rawNode ?? {}) as LarkPostNode
+      switch (node.tag) {
+        case 'text':
+          if (typeof node.text === 'string') parts.push(node.text)
+          break
+        case 'a': {
+          const label = typeof node.text === 'string' ? node.text : ''
+          const href = typeof node.href === 'string' ? node.href : ''
+          if (label && href) parts.push(`${label} (${href})`)
+          else if (href) parts.push(href)
+          else if (label) parts.push(label)
+          break
+        }
+        case 'img':
+          if (typeof node.image_key === 'string' && node.image_key) imageKeys.push(node.image_key)
+          break
+        // `at` and any unknown tag are intentionally dropped.
+      }
+    }
+    lines.push(parts.join(''))
+  }
+
+  let text = lines.join('\n').trim()
+  const title = typeof parsed.title === 'string' ? parsed.title.trim() : ''
+  if (title) text = text ? `${title}\n${text}` : title
+  return { text, imageKeys }
+}
+
+/**
  * Narrow projection over the SDK's `Client` for the methods we actually call.
  * The SDK's full type union is enormous (~250k lines) and changes shape between
  * minor versions; pinning a hand-rolled interface keeps our adapter loosely
@@ -468,10 +541,16 @@ export class LarkAdapter implements PlatformAdapter {
       if (msgType !== 'post') throw err
       finalMsgType = 'text'
       const fallbackText = stripMarkdownForLarkText(text)
+      // Surface Feishu's structured error (code/msg) so a future formatting
+      // regression is diagnosable — but never log the message body itself.
+      const larkErr = err as { response?: { data?: { code?: number; msg?: string } }; code?: number; msg?: string }
+      const larkData = larkErr.response?.data
       this.log.warn('[lark] post send failed; falling back to text', {
         event: 'lark_post_send_fallback',
         chatId: channelId,
         error: err instanceof Error ? err.message : String(err),
+        larkCode: larkData?.code ?? larkErr.code,
+        larkMsg: larkData?.msg ?? larkErr.msg,
       })
       result = await this.client.im.message.create({
         params: { receive_id_type: 'chat_id' },
@@ -834,6 +913,14 @@ export class LarkAdapter implements PlatformAdapter {
       return
     }
 
+    // `post` = rich text (text + inline images). Feishu sends "screenshot +
+    // caption" and any image-with-text this way, so it must be parsed rather
+    // than dropped.
+    if (message.message_type === 'post') {
+      await this.handlePostMessage(data)
+      return
+    }
+
     // Unhandled type — log and drop.
     this.log.info('[lark] dropped unsupported message type', {
       event: 'lark_unsupported_msg_type',
@@ -901,6 +988,63 @@ export class LarkAdapter implements PlatformAdapter {
   }
 
   /**
+   * Handle a `post` (rich-text) message: extract the plain text and download
+   * every embedded image, then dispatch one `IncomingMessage` carrying both.
+   * This is what makes "screenshot + caption" (and any image-with-text) work,
+   * since Feishu delivers those as `post`, not `image`/`text`.
+   */
+  private async handlePostMessage(data: LarkMessageEvent): Promise<void> {
+    if (!this.client || !this.messageHandler) return
+    const { sender, message } = data
+    const senderId =
+      sender.sender_id?.user_id ?? sender.sender_id?.open_id ?? sender.sender_id?.union_id ?? ''
+
+    const { text, imageKeys } = parseLarkPostContent(message.content)
+
+    const attachments: IncomingAttachment[] = []
+    for (const imageKey of imageKeys) {
+      const localPath = await this.downloadResource({
+        messageId: message.message_id,
+        fileKey: imageKey,
+        filename: `image-${randomBytes(4).toString('hex')}.jpg`,
+        isImage: true,
+      })
+      if (localPath) {
+        attachments.push({
+          type: 'photo',
+          fileId: imageKey,
+          fileName: `image${extname(localPath)}`,
+          localPath,
+        })
+      }
+    }
+
+    // Nothing usable survived (no text and every image download failed): log
+    // and drop so the run doesn't fire an empty turn.
+    if (!text && attachments.length === 0) {
+      this.log.info('[lark] post message had no extractable content', {
+        event: 'lark_post_empty',
+        messageId: message.message_id,
+        chatId: message.chat_id,
+        imageCount: imageKeys.length,
+      })
+      return
+    }
+
+    const msg: IncomingMessage = {
+      platform: 'lark',
+      channelId: message.chat_id,
+      messageId: message.message_id,
+      senderId,
+      text,
+      attachments: attachments.length ? attachments : undefined,
+      timestamp: parseInt(message.create_time, 10) || Date.now(),
+      raw: message,
+    }
+    this.dispatchIncomingMessage(msg)
+  }
+
+  /**
    * Download a Lark resource (image or file) to a local temp path.
    *
    * Lark resource URLs require bearer-token auth; we can't hand a URL to the
@@ -920,16 +1064,14 @@ export class LarkAdapter implements PlatformAdapter {
       const sdkResource = await (
         (this.client as unknown as {
           im: {
-            message: {
-              resource: {
-                get: (args: {
-                  path: { message_id: string; file_key: string }
-                  params: { type: 'image' | 'file' }
-                }) => Promise<{ writeFile: (path: string) => Promise<void> } & Record<string, unknown>>
-              }
+            messageResource: {
+              get: (args: {
+                path: { message_id: string; file_key: string }
+                params: { type: 'image' | 'file' }
+              }) => Promise<{ writeFile: (path: string) => Promise<void> } & Record<string, unknown>>
             }
           }
-        }).im.message.resource.get
+        }).im.messageResource.get
       )({
         path: { message_id: args.messageId, file_key: args.fileKey },
         params: { type: args.isImage ? 'image' : 'file' },

@@ -13,7 +13,7 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'bun:test'
-import { parseLarkCredentials, LarkAdapter } from '../adapters/lark/index'
+import { parseLarkCredentials, parseLarkPostContent, LarkAdapter } from '../adapters/lark/index'
 import type { IncomingMessage } from '../types'
 import { SeenMessageStore } from '../seen-message-store'
 
@@ -56,6 +56,163 @@ describe('parseLarkCredentials', () => {
     expect(() =>
       parseLarkCredentials(JSON.stringify({ appId: 'cli_x', appSecret: 'x', domain: 'larksuite' })),
     ).toThrow(/domain/i)
+  })
+})
+
+describe('parseLarkPostContent', () => {
+  it('extracts plain text from a post message', () => {
+    const content = JSON.stringify({
+      title: '',
+      content: [[{ tag: 'text', text: 'hello ' }, { tag: 'text', text: 'world' }]],
+    })
+    const result = parseLarkPostContent(content)
+    expect(result.text).toBe('hello world')
+    expect(result.imageKeys).toEqual([])
+  })
+
+  it('collects embedded image keys (screenshot + caption)', () => {
+    const content = JSON.stringify({
+      content: [
+        [{ tag: 'text', text: 'see this' }, { tag: 'img', image_key: 'img_v2_abc' }],
+        [{ tag: 'img', image_key: 'img_v2_def' }],
+      ],
+    })
+    const result = parseLarkPostContent(content)
+    expect(result.text).toBe('see this')
+    expect(result.imageKeys).toEqual(['img_v2_abc', 'img_v2_def'])
+  })
+
+  it('renders links as "label (href)" and drops @mentions', () => {
+    const content = JSON.stringify({
+      content: [
+        [
+          { tag: 'at', user_id: 'ou_bot', user_name: 'Bot' },
+          { tag: 'text', text: 'check ' },
+          { tag: 'a', text: 'docs', href: 'https://example.com' },
+        ],
+      ],
+    })
+    const result = parseLarkPostContent(content)
+    expect(result.text).toBe('check docs (https://example.com)')
+  })
+
+  it('prepends a non-empty title', () => {
+    const content = JSON.stringify({
+      title: 'Report',
+      content: [[{ tag: 'text', text: 'body' }]],
+    })
+    expect(parseLarkPostContent(content).text).toBe('Report\nbody')
+  })
+
+  it('joins multiple paragraphs with newlines', () => {
+    const content = JSON.stringify({
+      content: [[{ tag: 'text', text: 'line1' }], [{ tag: 'text', text: 'line2' }]],
+    })
+    expect(parseLarkPostContent(content).text).toBe('line1\nline2')
+  })
+
+  it('returns empty result on malformed JSON', () => {
+    expect(parseLarkPostContent('not-json')).toEqual({ text: '', imageKeys: [] })
+  })
+})
+
+describe('LarkAdapter — post (rich-text) inbound', () => {
+  type PostEvent = {
+    sender: { sender_id: { open_id: string } }
+    message: {
+      message_id: string
+      chat_id: string
+      chat_type: string
+      message_type: string
+      content: string
+      create_time: string
+    }
+  }
+
+  const bindHandle = (adapter: LarkAdapter) =>
+    (
+      adapter as unknown as { handleIncomingMessage: (event: PostEvent) => Promise<void> }
+    ).handleIncomingMessage.bind(adapter)
+
+  it('dispatches a text-only post message', async () => {
+    const adapter = new LarkAdapter()
+    // handlePostMessage guards on a truthy client; a stub is enough for the
+    // text-only path (no image download happens).
+    ;(adapter as unknown as { client: object }).client = { im: {} }
+    const received: IncomingMessage[] = []
+    adapter.onMessage(async (msg) => {
+      received.push(msg)
+    })
+
+    await bindHandle(adapter)({
+      sender: { sender_id: { open_id: 'ou_1' } },
+      message: {
+        message_id: 'om_post_text',
+        chat_id: 'oc_1',
+        chat_type: 'p2p',
+        message_type: 'post',
+        content: JSON.stringify({ content: [[{ tag: 'text', text: 'just text' }]] }),
+        create_time: '1779782400000',
+      },
+    })
+
+    expect(received).toHaveLength(1)
+    expect(received[0]?.text).toBe('just text')
+    expect(received[0]?.attachments).toBeUndefined()
+  })
+
+  it('downloads embedded images and dispatches text + attachment', async () => {
+    const adapter = new LarkAdapter()
+    const resourceCalls: Array<{ message_id: string; file_key: string }> = []
+    ;(
+      adapter as unknown as {
+        client: {
+          im: {
+            messageResource: {
+              get: (args: {
+                path: { message_id: string; file_key: string }
+                params: { type: 'image' | 'file' }
+              }) => Promise<{ writeFile: (path: string) => Promise<void> }>
+            }
+          }
+        }
+      }
+    ).client = {
+      im: {
+        messageResource: {
+          get: async (args) => {
+            resourceCalls.push(args.path)
+            return { writeFile: async () => {} }
+          },
+        },
+      },
+    }
+    const received: IncomingMessage[] = []
+    adapter.onMessage(async (msg) => {
+      received.push(msg)
+    })
+
+    await bindHandle(adapter)({
+      sender: { sender_id: { open_id: 'ou_1' } },
+      message: {
+        message_id: 'om_post_img',
+        chat_id: 'oc_1',
+        chat_type: 'p2p',
+        message_type: 'post',
+        content: JSON.stringify({
+          content: [[{ tag: 'text', text: 'screenshot:' }, { tag: 'img', image_key: 'img_v2_x' }]],
+        }),
+        create_time: '1779782400000',
+      },
+    })
+
+    expect(resourceCalls).toEqual([{ message_id: 'om_post_img', file_key: 'img_v2_x' }])
+    expect(received).toHaveLength(1)
+    expect(received[0]?.text).toBe('screenshot:')
+    expect(received[0]?.attachments).toHaveLength(1)
+    expect(received[0]?.attachments?.[0]?.type).toBe('photo')
+    expect(received[0]?.attachments?.[0]?.fileId).toBe('img_v2_x')
+    expect(received[0]?.attachments?.[0]?.localPath).toBeTruthy()
   })
 })
 
