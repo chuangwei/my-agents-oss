@@ -13,7 +13,7 @@ import { formatForLarkPost, wrapAsTrivialPost, type LarkFormatted } from '../for
 function mdText(result: LarkFormatted): string {
   expect(result.kind).toBe('post')
   if (result.kind !== 'post') throw new Error('expected post')
-  const content = result.post.post.zh_cn.content
+  const content = result.post.zh_cn.content
   expect(content.length).toBe(1)
   expect(content[0]!.length).toBe(1)
   const el = content[0]![0]!
@@ -108,12 +108,25 @@ describe('formatForLarkPost — md tag (rich content)', () => {
 describe('wrapAsTrivialPost', () => {
   it('produces a single-paragraph post with one plain text element', () => {
     const post = wrapAsTrivialPost('Hello there')
-    expect(post.post.zh_cn.content.length).toBe(1)
-    expect(post.post.zh_cn.content[0]!.length).toBe(1)
-    const el = post.post.zh_cn.content[0]![0]!
+    expect(post.zh_cn.content.length).toBe(1)
+    expect(post.zh_cn.content[0]!.length).toBe(1)
+    const el = post.zh_cn.content[0]![0]!
     expect(el.tag).toBe('text')
     if (el.tag === 'text') {
       expect(el.text).toBe('Hello there')
     }
+  })
+})
+
+describe('formatForLarkPost — wire shape (230001 regression)', () => {
+  it('serializes post content as {zh_cn:...} with NO outer "post" wrapper', () => {
+    const result = formatForLarkPost('Some **bold** text')
+    if (result.kind !== 'post') throw new Error('expected post')
+    // The im/v1 API rejects {"post":{"zh_cn":...}} with error 230001. The
+    // content must be the language map directly.
+    expect(result.post).not.toHaveProperty('post')
+    expect(result.post).toHaveProperty('zh_cn')
+    const serialized = JSON.stringify(result.post)
+    expect(serialized.startsWith('{"zh_cn":')).toBe(true)
   })
 })

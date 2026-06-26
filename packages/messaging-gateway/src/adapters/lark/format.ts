@@ -26,11 +26,19 @@ export type LarkPostElement =
   | { tag: 'text'; text: string }
   | { tag: 'md'; text: string }
 
+/**
+ * Wire shape of the `content` field for a `msg_type: post` message on the
+ * `im/v1/messages` API. This is the language map **directly** —
+ * `{"zh_cn":{"content":[...]}}` — with NO outer `post` wrapper. An earlier
+ * version wrapped it as `{post:{zh_cn:...}}` (the legacy custom-bot webhook
+ * shape), which the v1 API rejects with error 230001 "invalid message content"
+ * and silently degraded every formatted reply to plain text.
+ *
+ * @see create_json docs, post example: `{"zh_cn":{"content":[[{"tag":"md",...}]]}}`
+ */
 export interface LarkPost {
-  post: {
-    zh_cn: {
-      content: LarkPostElement[][]
-    }
+  zh_cn: {
+    content: LarkPostElement[][]
   }
 }
 
@@ -55,7 +63,7 @@ export function formatForLarkPost(markdown: string): LarkFormatted {
 
   return {
     kind: 'post',
-    post: { post: { zh_cn: { content: [[{ tag: 'md', text: trimmed }]] } } },
+    post: { zh_cn: { content: [[{ tag: 'md', text: trimmed }]] } },
   }
 }
 
@@ -66,10 +74,8 @@ export function formatForLarkPost(markdown: string): LarkFormatted {
  */
 export function wrapAsTrivialPost(text: string): LarkPost {
   return {
-    post: {
-      zh_cn: {
-        content: [[{ tag: 'text', text }]],
-      },
+    zh_cn: {
+      content: [[{ tag: 'text', text }]],
     },
   }
 }

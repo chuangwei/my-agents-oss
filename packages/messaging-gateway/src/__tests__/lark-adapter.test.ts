@@ -9,7 +9,7 @@
  * End-to-end behaviour (event dispatch, send/edit roundtrips) is verified
  * via manual smoke against a real Lark Custom App.
  */
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'bun:test'
@@ -182,7 +182,9 @@ describe('LarkAdapter — post (rich-text) inbound', () => {
         messageResource: {
           get: async (args) => {
             resourceCalls.push(args.path)
-            return { writeFile: async () => {} }
+            // Write a real (tiny) file so the adapter's post-download size check
+            // can stat it, mirroring the SDK's streaming `writeFile`.
+            return { writeFile: async (p: string) => writeFileSync(p, 'fake-image-bytes') }
           },
         },
       },
@@ -213,6 +215,200 @@ describe('LarkAdapter — post (rich-text) inbound', () => {
     expect(received[0]?.attachments?.[0]?.type).toBe('photo')
     expect(received[0]?.attachments?.[0]?.fileId).toBe('img_v2_x')
     expect(received[0]?.attachments?.[0]?.localPath).toBeTruthy()
+  })
+})
+
+describe('LarkAdapter — user-visible fallbacks (no silent drops)', () => {
+  type AnyEvent = {
+    sender: { sender_id: { open_id: string } }
+    message: {
+      message_id: string
+      chat_id: string
+      chat_type: string
+      message_type: string
+      content: string
+      create_time: string
+    }
+  }
+  const bindHandle = (adapter: LarkAdapter) =>
+    (
+      adapter as unknown as { handleIncomingMessage: (event: AnyEvent) => Promise<void> }
+    ).handleIncomingMessage.bind(adapter)
+
+  const flush = () => new Promise((r) => setTimeout(r, 10))
+
+  it('replies with a hint for unsupported voice messages in DMs', async () => {
+    const adapter = new LarkAdapter()
+    const sends: Array<{ data: { receive_id: string; msg_type: string; content: string } }> = []
+    ;(adapter as unknown as { client: unknown }).client = {
+      im: {
+        message: {
+          create: async (a: { data: { receive_id: string; msg_type: string; content: string } }) => {
+            sends.push(a)
+            return { data: { message_id: 'om_notice' } }
+          },
+        },
+      },
+    }
+    adapter.onMessage(async () => {})
+
+    await bindHandle(adapter)({
+      sender: { sender_id: { open_id: 'ou_1' } },
+      message: {
+        message_id: 'om_audio',
+        chat_id: 'oc_1',
+        chat_type: 'p2p',
+        message_type: 'audio',
+        content: '{}',
+        create_time: '1779782400000',
+      },
+    })
+    await flush()
+
+    expect(sends).toHaveLength(1)
+    expect(sends[0]?.data.receive_id).toBe('oc_1')
+    expect(sends[0]?.data.content).toContain('语音')
+  })
+
+  it('downloads a sticker as an image attachment (vision) instead of just notifying', async () => {
+    const adapter = new LarkAdapter()
+    const sends: unknown[] = []
+    ;(adapter as unknown as { client: unknown }).client = {
+      im: {
+        message: { create: async (a: unknown) => { sends.push(a); return { data: {} } } },
+        messageResource: {
+          // PNG magic bytes so fixImageExtension keeps/normalizes the type.
+          get: async () => ({
+            writeFile: async (p: string) =>
+              writeFileSync(p, Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])),
+          }),
+        },
+      },
+    }
+    const received: IncomingMessage[] = []
+    adapter.onMessage(async (msg) => {
+      received.push(msg)
+    })
+
+    await bindHandle(adapter)({
+      sender: { sender_id: { open_id: 'ou_1' } },
+      message: {
+        message_id: 'om_sticker',
+        chat_id: 'oc_1',
+        chat_type: 'p2p',
+        message_type: 'sticker',
+        content: JSON.stringify({ file_key: 'sticker_v2_x' }),
+        create_time: '1779782400000',
+      },
+    })
+    await flush()
+
+    // Dispatched as a photo attachment; no "can't read" notice sent.
+    expect(received).toHaveLength(1)
+    expect(received[0]?.attachments).toHaveLength(1)
+    expect(received[0]?.attachments?.[0]?.type).toBe('photo')
+    expect(received[0]?.attachments?.[0]?.localPath?.endsWith('.png')).toBe(true)
+    expect(sends).toHaveLength(0)
+  })
+
+  it('falls back to a notice when the sticker image cannot be downloaded', async () => {
+    const adapter = new LarkAdapter()
+    const sends: Array<{ data: { content: string } }> = []
+    ;(adapter as unknown as { client: unknown }).client = {
+      im: {
+        message: {
+          create: async (a: { data: { content: string } }) => { sends.push(a); return { data: {} } },
+        },
+        messageResource: {
+          get: async () => { throw new Error('resource fetch failed') },
+        },
+      },
+    }
+    const received: IncomingMessage[] = []
+    adapter.onMessage(async (msg) => {
+      received.push(msg)
+    })
+
+    await bindHandle(adapter)({
+      sender: { sender_id: { open_id: 'ou_1' } },
+      message: {
+        message_id: 'om_sticker_fail',
+        chat_id: 'oc_1',
+        chat_type: 'p2p',
+        message_type: 'sticker',
+        content: JSON.stringify({ file_key: 'sticker_v2_y' }),
+        create_time: '1779782400000',
+      },
+    })
+    await flush()
+
+    expect(received).toHaveLength(0)
+    expect(sends).toHaveLength(1)
+    expect(sends[0]?.data.content).toContain('表情包')
+  })
+
+  it('stays silent for unsupported types in group chats', async () => {
+    const adapter = new LarkAdapter()
+    const sends: unknown[] = []
+    ;(adapter as unknown as { client: unknown }).client = {
+      im: { message: { create: async (a: unknown) => { sends.push(a); return { data: {} } } } },
+    }
+    adapter.onMessage(async () => {})
+
+    await bindHandle(adapter)({
+      sender: { sender_id: { open_id: 'ou_1' } },
+      message: {
+        message_id: 'om_audio_group',
+        chat_id: 'oc_group',
+        chat_type: 'group',
+        message_type: 'audio',
+        content: '{}',
+        create_time: '1779782400000',
+      },
+    })
+    await flush()
+
+    expect(sends).toHaveLength(0)
+  })
+
+  it('replies when an attachment exceeds the size cap and drops it', async () => {
+    const adapter = new LarkAdapter()
+    const sends: Array<{ data: { content: string } }> = []
+    ;(adapter as unknown as { client: unknown }).client = {
+      im: {
+        message: {
+          create: async (a: { data: { content: string } }) => {
+            sends.push(a)
+            return { data: { message_id: 'om_notice' } }
+          },
+        },
+        messageResource: {
+          // Buffer path: 1 byte over the adapter's 20MB cap.
+          get: async () => ({ file: Buffer.alloc(20 * 1024 * 1024 + 1) }),
+        },
+      },
+    }
+    const received: IncomingMessage[] = []
+    adapter.onMessage(async (msg) => {
+      received.push(msg)
+    })
+
+    await bindHandle(adapter)({
+      sender: { sender_id: { open_id: 'ou_1' } },
+      message: {
+        message_id: 'om_bigfile',
+        chat_id: 'oc_1',
+        chat_type: 'p2p',
+        message_type: 'file',
+        content: JSON.stringify({ file_key: 'file_v2_big', file_name: 'huge.zip' }),
+        create_time: '1779782400000',
+      },
+    })
+    await flush()
+
+    expect(received).toHaveLength(0)
+    expect(sends).toHaveLength(1)
+    expect(sends[0]?.data.content).toContain('文件太大')
   })
 })
 
