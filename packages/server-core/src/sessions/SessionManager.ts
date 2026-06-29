@@ -100,7 +100,7 @@ import { buildBackendRuntimeSignature, buildRestartRequiredSignature, filterAtta
 
 // Import from server-core domain utilities
 import { sanitizeForTitle, shouldActivateBrowserOverlay, normalizeBrowserToolName, rollbackFailedBranchCreation, releaseBrowserOwnershipOnForcedStop } from '@craft-agent/server-core/domain'
-import { resizeImageForAPI, resizeIconBuffer } from '@craft-agent/server-core/services'
+import { resizeImageForAPI, resizeIconBuffer, persistInboundAttachmentsForDisplay, compressOversizedInboundImages } from '@craft-agent/server-core/services'
 export { sanitizeForTitle }
 
 // Module-level platform ref — set once during init via setSessionPlatform()
@@ -5465,6 +5465,39 @@ export class SessionManager implements ISessionManager {
 
     // Ensure messages are loaded before we try to add new ones
     await this.ensureMessagesLoaded(managed)
+
+    // Inbound messaging adapters (Lark/WeChat/Telegram/WhatsApp) route raw
+    // FileAttachments but no StoredAttachments. The UI renders a user message's
+    // attachments from `StoredAttachment[]` (needs `thumbnailBase64`/`storedPath`),
+    // so without this inbound images/files never appear in the transcript even
+    // though the model still receives them. Derive display StoredAttachments here
+    // so every server-side caller that passes raw attachments gets UI parity.
+    // The desktop client already supplies storedAttachments, so this no-ops for it.
+    if (attachments?.length && !storedAttachments?.length) {
+      // Resize oversized inbound images BEFORE they reach the model/history.
+      // Messaging adapters feed raw bytes and skip the desktop STORE_ATTACHMENT
+      // resize path; a >5MB image otherwise gets rejected by the API and, since
+      // it's embedded in the conversation history, poisons the whole session.
+      try {
+        attachments = await compressOversizedInboundImages(attachments)
+      } catch (err) {
+        sessionLog.warn(
+          `Failed to compress oversized inbound image(s): ${err instanceof Error ? err.message : String(err)}`,
+        )
+      }
+      try {
+        const derived = await persistInboundAttachmentsForDisplay(
+          managed.workspace.rootPath,
+          sessionId,
+          attachments,
+        )
+        if (derived.length > 0) storedAttachments = derived
+      } catch (err) {
+        sessionLog.warn(
+          `Failed to derive display attachments for inbound message: ${err instanceof Error ? err.message : String(err)}`,
+        )
+      }
+    }
 
     // If currently processing, behavior depends on the connection's
     // `midStreamBehavior` (resolved via {@link resolveMidStreamBehavior},
