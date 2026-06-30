@@ -85,6 +85,13 @@ if [ "$UPLOAD" = true ]; then
     echo "Will upload to S3 after build"
 fi
 
+# GitHub release-asset downloads are flaky from some local networks.
+# electron-builder respects ELECTRON_MIRROR; keep CI on its default unless the
+# workflow explicitly overrides it.
+if [ -z "${CI:-}" ]; then
+    export ELECTRON_MIRROR="${ELECTRON_MIRROR:-https://npmmirror.com/mirrors/electron/}"
+fi
+
 # 1. Clean previous build artifacts
 echo "Cleaning previous builds..."
 rm -rf "$ELECTRON_DIR/vendor"
@@ -217,8 +224,10 @@ cd "$ELECTRON_DIR"
 # Set up environment for electron-builder
 export CSC_IDENTITY_AUTO_DISCOVERY=true
 
-# Build electron-builder arguments
-BUILDER_ARGS="--mac --${ARCH}"
+# Build only the requested architecture. `--mac --arm64` still allows
+# electron-builder to expand the target list from electron-builder.yml; the
+# explicit target form keeps local and CI package jobs scoped.
+BUILDER_ARGS=(--mac "dmg:${ARCH}" "zip:${ARCH}")
 
 # Add code signing if identity is available
 if [ -n "$APPLE_SIGNING_IDENTITY" ]; then
@@ -242,7 +251,7 @@ if [ -n "$APPLE_ID" ] && [ -n "$APPLE_TEAM_ID" ] && [ -n "$APPLE_APP_SPECIFIC_PA
 fi
 
 # Run electron-builder
-npx electron-builder $BUILDER_ARGS
+npx electron-builder "${BUILDER_ARGS[@]}"
 
 # 8. Verify the DMG was built
 # electron-builder.yml uses artifactName to output: Craft-Agents-${arch}.dmg
