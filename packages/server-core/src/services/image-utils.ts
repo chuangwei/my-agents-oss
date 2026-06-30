@@ -81,6 +81,24 @@ export async function getImageSize(buffer: Buffer): Promise<{ width: number; hei
 }
 
 /**
+ * Generate a small PNG thumbnail (200×200, fit-inside) and return it
+ * base64-encoded for renderer display. Accepts an image file path or buffer.
+ * Returns undefined if the input can't be processed (non-image, corrupt, or
+ * the image processor is unavailable) — callers should fall back to an icon.
+ */
+export async function generateThumbnailBase64(input: Buffer | string): Promise<string | undefined> {
+  try {
+    const png = await imageProcessor.process(input, {
+      resize: { width: 200, height: 200 },
+      format: 'png',
+    })
+    return png.toString('base64')
+  } catch {
+    return undefined
+  }
+}
+
+/**
  * Resize an image buffer to fit within maxSize×maxSize, output as PNG.
  * Returns the resized PNG buffer, or undefined if the input is invalid.
  */

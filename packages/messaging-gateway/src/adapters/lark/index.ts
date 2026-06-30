@@ -10,7 +10,7 @@
  * interactive cards, attachments, and Markdown→post rich-text formatting.
  */
 
-import { writeFileSync } from 'node:fs'
+import { writeFileSync, statSync, unlinkSync, readFileSync, renameSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { extname, join } from 'node:path'
 import { randomBytes } from 'node:crypto'
@@ -41,11 +41,37 @@ import {
 import { SeenMessageStore } from '../../seen-message-store'
 
 /**
- * Hard cap for downloaded attachment size. Matches Telegram's MAX_ATTACHMENT_BYTES
- * — files larger than this would be rejected by `readFileAttachment` anyway, so
- * we fail fast in the adapter with a user-visible reply.
+ * Hard cap for downloaded attachment size. Matches `MAX_FILE_SIZE` in
+ * `@craft-agent/shared/utils/files` — files larger than this would be rejected
+ * by `readFileAttachment` anyway, so we fail fast in the adapter with a
+ * user-visible reply instead of letting the reader throw downstream.
  */
 const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024
+
+/**
+ * Message types we can't process yet but that are clearly user content — we
+ * reply with a hint instead of silently dropping. System/event-ish types stay
+ * silent to avoid noise.
+ */
+const UNSUPPORTED_NOTICE_TYPES = new Set(['audio', 'media', 'sticker'])
+
+const UNSUPPORTED_NOTICE_TEXT: Record<string, string> = {
+  audio: '我暂时还听不了语音消息,麻烦发文字或截图给我~',
+  media: '我暂时还看不了视频消息,麻烦发文字或截图给我~',
+  sticker: '我暂时还看不懂表情包,有事可以直接发文字给我~',
+}
+
+const UNSUPPORTED_NOTICE_DEFAULT = '我暂时还处理不了这种消息,麻烦发文字或截图给我~'
+
+/** Reply sent when an attachment is too large to download. */
+const ATTACHMENT_TOO_LARGE_NOTICE = `文件太大了(超过 ${Math.round(
+  MAX_ATTACHMENT_BYTES / (1024 * 1024),
+)}MB),我这边收不下,麻烦压缩后再发,或者直接发文字/截图~`
+
+/** Outcome of a resource download, so callers can give specific user feedback. */
+type DownloadResult =
+  | { ok: true; localPath: string }
+  | { ok: false; reason: 'too_large' | 'error' }
 
 const NOOP_LOGGER: MessagingLogger = {
   info: () => {},
@@ -163,6 +189,79 @@ function stripMarkdownForLarkText(text: string): string {
     .replace(/(\*|_)(.*?)\1/g, '$2')
     .replace(/~~(.*?)~~/g, '$1')
     .replace(/`([^`]+)`/g, '$1')
+}
+
+/**
+ * A single inline node inside a Lark `post` (rich-text) message. Lark nests
+ * paragraphs as `content: Node[][]` — an array of lines, each an array of
+ * inline runs. We only consume the handful of tags that carry user intent.
+ */
+interface LarkPostNode {
+  tag?: string
+  text?: string
+  href?: string
+  image_key?: string
+  user_name?: string
+}
+
+/**
+ * Flatten a Lark `post` message's JSON content into plain text + the
+ * `image_key`s of any embedded screenshots/images.
+ *
+ * This is the inbound counterpart to `formatForLarkPost` (outbound). It exists
+ * because Feishu sends "screenshot + caption" (and any image-with-text) as a
+ * `post` message — NOT as `image`/`text` — so without this the whole message
+ * was being dropped as an unsupported type.
+ *
+ * Tag handling:
+ *  - `text` → kept verbatim
+ *  - `a`    → rendered as `label (href)` so the URL survives for the agent
+ *  - `img`  → `image_key` collected for download (text drops the node)
+ *  - `at`   → dropped (mirrors `stripMentionPrefix` for text messages — the
+ *             agent doesn't need the @bot mention noise)
+ *  - other  → ignored (emotion stickers, etc.)
+ */
+export function parseLarkPostContent(rawContent: string): { text: string; imageKeys: string[] } {
+  let parsed: { title?: unknown; content?: unknown }
+  try {
+    parsed = JSON.parse(rawContent)
+  } catch {
+    return { text: '', imageKeys: [] }
+  }
+
+  const imageKeys: string[] = []
+  const lines: string[] = []
+  const rows = Array.isArray(parsed.content) ? (parsed.content as unknown[]) : []
+
+  for (const row of rows) {
+    const parts: string[] = []
+    for (const rawNode of Array.isArray(row) ? (row as unknown[]) : []) {
+      const node = (rawNode ?? {}) as LarkPostNode
+      switch (node.tag) {
+        case 'text':
+          if (typeof node.text === 'string') parts.push(node.text)
+          break
+        case 'a': {
+          const label = typeof node.text === 'string' ? node.text : ''
+          const href = typeof node.href === 'string' ? node.href : ''
+          if (label && href) parts.push(`${label} (${href})`)
+          else if (href) parts.push(href)
+          else if (label) parts.push(label)
+          break
+        }
+        case 'img':
+          if (typeof node.image_key === 'string' && node.image_key) imageKeys.push(node.image_key)
+          break
+        // `at` and any unknown tag are intentionally dropped.
+      }
+    }
+    lines.push(parts.join(''))
+  }
+
+  let text = lines.join('\n').trim()
+  const title = typeof parsed.title === 'string' ? parsed.title.trim() : ''
+  if (title) text = text ? `${title}\n${text}` : title
+  return { text, imageKeys }
 }
 
 /**
@@ -468,10 +567,16 @@ export class LarkAdapter implements PlatformAdapter {
       if (msgType !== 'post') throw err
       finalMsgType = 'text'
       const fallbackText = stripMarkdownForLarkText(text)
+      // Surface Feishu's structured error (code/msg) so a future formatting
+      // regression is diagnosable — but never log the message body itself.
+      const larkErr = err as { response?: { data?: { code?: number; msg?: string } }; code?: number; msg?: string }
+      const larkData = larkErr.response?.data
       this.log.warn('[lark] post send failed; falling back to text', {
         event: 'lark_post_send_fallback',
         chatId: channelId,
         error: err instanceof Error ? err.message : String(err),
+        larkCode: larkData?.code ?? larkErr.code,
+        larkMsg: larkData?.msg ?? larkErr.msg,
       })
       result = await this.client.im.message.create({
         params: { receive_id_type: 'chat_id' },
@@ -834,13 +939,42 @@ export class LarkAdapter implements PlatformAdapter {
       return
     }
 
-    // Unhandled type — log and drop.
+    // `post` = rich text (text + inline images). Feishu sends "screenshot +
+    // caption" and any image-with-text this way, so it must be parsed rather
+    // than dropped.
+    if (message.message_type === 'post') {
+      await this.handlePostMessage(data)
+      return
+    }
+
+    // Stickers carry a `file_key` to a small image. Try to download it as an
+    // image so the agent's vision can actually "see" it; only fall through to
+    // the unsupported-type notice if the download fails.
+    if (message.message_type === 'sticker') {
+      const handled = await this.handleStickerMessage(data)
+      if (handled) return
+    }
+
+    // Unhandled type — log and drop. For user-sent media (voice/video/sticker)
+    // we also reply once so the user isn't left with "seen, no answer".
     this.log.info('[lark] dropped unsupported message type', {
       event: 'lark_unsupported_msg_type',
       messageType: message.message_type,
       messageId: message.message_id,
       chatId: message.chat_id,
     })
+
+    if (UNSUPPORTED_NOTICE_TYPES.has(message.message_type) && message.chat_type === 'p2p') {
+      const notice = UNSUPPORTED_NOTICE_TEXT[message.message_type] ?? UNSUPPORTED_NOTICE_DEFAULT
+      this.sendText(message.chat_id, notice).catch((err: unknown) => {
+        this.log.warn('[lark] failed to send unsupported-type notice', {
+          event: 'lark_unsupported_notice_failed',
+          chatId: message.chat_id,
+          messageType: message.message_type,
+          error: err instanceof Error ? err.message : String(err),
+        })
+      })
+    }
   }
 
   private async handleAttachmentMessage(data: LarkMessageEvent): Promise<void> {
@@ -873,19 +1007,24 @@ export class LarkAdapter implements PlatformAdapter {
       ? `image-${randomBytes(4).toString('hex')}.jpg`
       : parsedContent.file_name ?? `file-${randomBytes(4).toString('hex')}.bin`
 
-    const localPath = await this.downloadResource({
+    const download = await this.downloadResource({
       messageId: message.message_id,
       fileKey,
       filename: fallbackName,
       isImage,
     })
-    if (!localPath) return
+    if (!download.ok) {
+      if (download.reason === 'too_large' && message.chat_type === 'p2p') {
+        this.sendText(message.chat_id, ATTACHMENT_TOO_LARGE_NOTICE).catch(() => {})
+      }
+      return
+    }
 
     const incomingAttachment: IncomingAttachment = {
       type: isImage ? 'photo' : 'document',
       fileId: fileKey,
       fileName: fallbackName,
-      localPath,
+      localPath: download.localPath,
     }
     const msg: IncomingMessage = {
       platform: 'lark',
@@ -894,6 +1033,166 @@ export class LarkAdapter implements PlatformAdapter {
       senderId,
       text: '',
       attachments: [incomingAttachment],
+      timestamp: parseInt(message.create_time, 10) || Date.now(),
+      raw: message,
+    }
+    this.dispatchIncomingMessage(msg)
+  }
+
+  /**
+   * Handle a `sticker` message by downloading its image so the agent's vision
+   * can see it (rather than just replying "I can't read stickers"). Feishu
+   * sticker content is `{"file_key":"..."}`.
+   *
+   * Returns `true` when the sticker was downloaded and dispatched; `false` when
+   * it couldn't be handled (no key / download failed), so the caller falls back
+   * to the unsupported-type notice. This keeps a hard "no regression" guarantee.
+   */
+  private async handleStickerMessage(data: LarkMessageEvent): Promise<boolean> {
+    if (!this.client || !this.messageHandler) return false
+    const { sender, message } = data
+    const senderId =
+      sender.sender_id?.user_id ?? sender.sender_id?.open_id ?? sender.sender_id?.union_id ?? ''
+
+    let fileKey: string | undefined
+    try {
+      fileKey = (JSON.parse(message.content) as { file_key?: string }).file_key
+    } catch {
+      fileKey = undefined
+    }
+    if (!fileKey) {
+      this.log.warn('[lark] sticker missing file_key', {
+        event: 'lark_sticker_no_key',
+        messageId: message.message_id,
+      })
+      return false
+    }
+
+    const download = await this.downloadResource({
+      messageId: message.message_id,
+      fileKey,
+      filename: `sticker-${randomBytes(4).toString('hex')}.webp`,
+      isImage: true,
+    })
+    if (!download.ok) {
+      // Couldn't fetch the sticker image — let the caller send the notice.
+      return false
+    }
+
+    // Feishu stickers can be webp/png/gif; the downstream reader keys off the
+    // file extension to set the media type, so a wrong extension would make the
+    // model API reject the image on a mime/data mismatch. Sniff the real format.
+    const localPath = this.fixImageExtension(download.localPath)
+
+    const msg: IncomingMessage = {
+      platform: 'lark',
+      channelId: message.chat_id,
+      messageId: message.message_id,
+      senderId,
+      text: '',
+      attachments: [
+        {
+          type: 'photo',
+          fileId: fileKey,
+          fileName: `sticker${extname(localPath)}`,
+          localPath,
+        },
+      ],
+      timestamp: parseInt(message.create_time, 10) || Date.now(),
+      raw: message,
+    }
+    this.dispatchIncomingMessage(msg)
+    return true
+  }
+
+  /**
+   * Rename a downloaded image temp file to match its actual format (sniffed from
+   * magic bytes), since the downstream reader infers the media type from the
+   * extension. Returns the (possibly new) path; falls back to the original path
+   * on any error.
+   */
+  private fixImageExtension(localPath: string): string {
+    try {
+      const head = readFileSync(localPath).subarray(0, 12)
+      let ext = ''
+      if (head[0] === 0x89 && head[1] === 0x50 && head[2] === 0x4e && head[3] === 0x47) ext = '.png'
+      else if (head[0] === 0xff && head[1] === 0xd8 && head[2] === 0xff) ext = '.jpg'
+      else if (head[0] === 0x47 && head[1] === 0x49 && head[2] === 0x46) ext = '.gif'
+      else if (
+        head[0] === 0x52 && head[1] === 0x49 && head[2] === 0x46 && head[3] === 0x46 &&
+        head[8] === 0x57 && head[9] === 0x45 && head[10] === 0x42 && head[11] === 0x50
+      ) ext = '.webp'
+
+      if (!ext || extname(localPath).toLowerCase() === ext) return localPath
+
+      const current = extname(localPath)
+      const renamed = `${localPath.slice(0, localPath.length - current.length)}${ext}`
+      renameSync(localPath, renamed)
+      return renamed
+    } catch {
+      return localPath
+    }
+  }
+
+  /**
+   * Handle a `post` (rich-text) message: extract the plain text and download
+   * every embedded image, then dispatch one `IncomingMessage` carrying both.
+   * This is what makes "screenshot + caption" (and any image-with-text) work,
+   * since Feishu delivers those as `post`, not `image`/`text`.
+   */
+  private async handlePostMessage(data: LarkMessageEvent): Promise<void> {
+    if (!this.client || !this.messageHandler) return
+    const { sender, message } = data
+    const senderId =
+      sender.sender_id?.user_id ?? sender.sender_id?.open_id ?? sender.sender_id?.union_id ?? ''
+
+    const { text, imageKeys } = parseLarkPostContent(message.content)
+
+    const attachments: IncomingAttachment[] = []
+    let anyTooLarge = false
+    for (const imageKey of imageKeys) {
+      const download = await this.downloadResource({
+        messageId: message.message_id,
+        fileKey: imageKey,
+        filename: `image-${randomBytes(4).toString('hex')}.jpg`,
+        isImage: true,
+      })
+      if (download.ok) {
+        attachments.push({
+          type: 'photo',
+          fileId: imageKey,
+          fileName: `image${extname(download.localPath)}`,
+          localPath: download.localPath,
+        })
+      } else if (download.reason === 'too_large') {
+        anyTooLarge = true
+      }
+    }
+
+    // At least one image was too big to ingest — tell the user (DMs only).
+    if (anyTooLarge && message.chat_type === 'p2p') {
+      this.sendText(message.chat_id, ATTACHMENT_TOO_LARGE_NOTICE).catch(() => {})
+    }
+
+    // Nothing usable survived (no text and every image download failed): log
+    // and drop so the run doesn't fire an empty turn.
+    if (!text && attachments.length === 0) {
+      this.log.info('[lark] post message had no extractable content', {
+        event: 'lark_post_empty',
+        messageId: message.message_id,
+        chatId: message.chat_id,
+        imageCount: imageKeys.length,
+      })
+      return
+    }
+
+    const msg: IncomingMessage = {
+      platform: 'lark',
+      channelId: message.chat_id,
+      messageId: message.message_id,
+      senderId,
+      text,
+      attachments: attachments.length ? attachments : undefined,
       timestamp: parseInt(message.create_time, 10) || Date.now(),
       raw: message,
     }
@@ -912,53 +1211,66 @@ export class LarkAdapter implements PlatformAdapter {
     fileKey: string
     filename: string
     isImage: boolean
-  }): Promise<string | null> {
-    if (!this.client) return null
+  }): Promise<DownloadResult> {
+    if (!this.client) return { ok: false, reason: 'error' }
+    const ext = extname(args.filename) || (args.isImage ? '.jpg' : '.bin')
+    const localPath = join(tmpdir(), `lark-${randomBytes(8).toString('hex')}${ext}`)
     try {
       // The SDK's `im.message.resource.get` returns a Node stream-like object
       // with a `writeFile` helper for the common case. We use that for size+brevity.
       const sdkResource = await (
         (this.client as unknown as {
           im: {
-            message: {
-              resource: {
-                get: (args: {
-                  path: { message_id: string; file_key: string }
-                  params: { type: 'image' | 'file' }
-                }) => Promise<{ writeFile: (path: string) => Promise<void> } & Record<string, unknown>>
-              }
+            messageResource: {
+              get: (args: {
+                path: { message_id: string; file_key: string }
+                params: { type: 'image' | 'file' }
+              }) => Promise<{ writeFile: (path: string) => Promise<void> } & Record<string, unknown>>
             }
           }
-        }).im.message.resource.get
+        }).im.messageResource.get
       )({
         path: { message_id: args.messageId, file_key: args.fileKey },
         params: { type: args.isImage ? 'image' : 'file' },
       })
 
-      const ext = extname(args.filename) || (args.isImage ? '.jpg' : '.bin')
-      const localPath = join(tmpdir(), `lark-${randomBytes(8).toString('hex')}${ext}`)
       // Different SDK versions expose either `writeFile`, `file` (Buffer), or
       // a plain Node Readable. Handle the common shapes.
       if (typeof sdkResource.writeFile === 'function') {
         await sdkResource.writeFile(localPath)
+        // `writeFile` streams without a size guard, so enforce the cap afterward.
+        if (statSync(localPath).size > MAX_ATTACHMENT_BYTES) {
+          this.safeUnlink(localPath)
+          return { ok: false, reason: 'too_large' }
+        }
       } else if (sdkResource.file instanceof Buffer) {
         const buf = sdkResource.file
         if (buf.length > MAX_ATTACHMENT_BYTES) {
-          throw new Error(`attachment exceeds ${MAX_ATTACHMENT_BYTES} bytes`)
+          return { ok: false, reason: 'too_large' }
         }
         writeFileSync(localPath, buf)
       } else {
         throw new Error('Lark resource SDK returned an unsupported shape')
       }
-      return localPath
+      return { ok: true, localPath }
     } catch (err: unknown) {
+      this.safeUnlink(localPath)
       this.log.warn('[lark] resource download failed', {
         event: 'lark_resource_download_failed',
         messageId: args.messageId,
         fileKey: args.fileKey,
         error: err instanceof Error ? err.message : String(err),
       })
-      return null
+      return { ok: false, reason: 'error' }
+    }
+  }
+
+  /** Best-effort unlink that never throws (used to clean up partial downloads). */
+  private safeUnlink(path: string): void {
+    try {
+      unlinkSync(path)
+    } catch {
+      // Already gone or never created — nothing to do.
     }
   }
 
